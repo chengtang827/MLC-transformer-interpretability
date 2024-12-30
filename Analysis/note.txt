@@ -1,0 +1,6 @@
+Stage 1:
+    Recorded generalization sessions:
+
+    Sessions without photodiode:
+
+    Sessions without calibration:

@@ -1,0 +1,5 @@
+download parsed sessions:
+
+cd /Users/laptopd/Documents/Compositionality/Analysis
+
+rsync -ruv c_tang@openmind-dtn.mit.edu:/om2/user/c_tang/jazlab/CompTask/data_processed/ ./trials_parsed/

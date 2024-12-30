@@ -1,0 +1,5 @@
+1. open terminal
+2. cd /Users/ina/Documents/Faure
+3. git add . # add all the changed files
+4. git commit -m 'your change'
+5. git push

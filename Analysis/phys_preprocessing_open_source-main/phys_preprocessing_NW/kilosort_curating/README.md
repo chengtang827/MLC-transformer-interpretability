@@ -1,0 +1,1 @@
+Tried CatGT.  Tried specifying dead (not "connected"0 channels in channel map. Neither helped sorting.

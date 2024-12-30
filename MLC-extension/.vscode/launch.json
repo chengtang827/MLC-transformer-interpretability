@@ -1,0 +1,32 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Current File",
+            "type": "python",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            // for evaluation
+            "args": ["--fn_out_model", "net-HookedBIMLNew.pt", "--episode_type", "my_test", "--max", "--verbose", "--make_plots"], 
+            // for training
+            // "args": [
+            //     "--fn_out_model",
+            //     "net-HookedBIMLNew.pt",
+            //     "--episode_type",
+            //     "algebraic+biases",
+            //     "--nlayers_encoder",
+            //     "3",
+            //     "--nlayers_decoder",
+            //     "3",
+            // ],
+            "purpose": [
+                "debug-in-terminal"
+            ]
+        }
+    ]
+}
