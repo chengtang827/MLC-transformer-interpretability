@@ -29,7 +29,7 @@ def train(batch, net, loss_fn, optimizer, langs):
     target_lengths = batch['yq_lengths'] # list of size b*nq
     target_shift = batch['yq_sos_padded'] # b*nq x max_length
         # shifted targets with padding (added SOS symbol at beginning and removed EOS symbol) 
-    decoder_output = net(target_shift, batch) # b*nq x max_length x output_size
+    decoder_output = net(target_shift, batch) # b*nq x max_length x output_size of logits
     logits_flat = decoder_output.reshape(-1, decoder_output.shape[-1]) # (b*nq*max_length, output_size)
     loss = loss_fn(logits_flat, target_batches.reshape(-1))
     assert(not torch.isinf(loss))

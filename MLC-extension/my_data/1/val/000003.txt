@@ -1,21 +1,7 @@
 *SUPPORT*
 IN: dax tufa OUT: BLUE BLUE
-IN: dax tufa OUT: BLUE BLUE
-IN: dax tufa OUT: BLUE BLUE
-IN: dax OUT: BLUE
-IN: dax OUT: BLUE
 IN: dax OUT: BLUE
 IN: blicket OUT: GREEN
-IN: blicket OUT: GREEN
-IN: blicket OUT: GREEN
-IN: dax OUT: BLUE
-IN: dax OUT: BLUE
-IN: dax OUT: BLUE
-IN: dax OUT: BLUE
-IN: dax OUT: BLUE
-
-
-
 
 
 *QUERY*

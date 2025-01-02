@@ -25,6 +25,6 @@ module add openmind/gcc/5.3.0
 
 conda activate MI
 cd /om2/user/c_tang/jazlab/MLC-extension
-python train.py --episode_type algebraic_noise --fn_out_model net-HookedBIMLNew.pt
+python train.py --episode_type algebraic_noise --fn_out_model net-HookedBIMLSmall.pt --nlayers_encoder 2 --nlayers_decoder 2
 
 

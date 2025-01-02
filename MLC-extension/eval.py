@@ -12,13 +12,36 @@ from train_lib import seed_all, extract, display_input_output, assert_consist_la
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 from pathlib import Path
 from torch.utils.data import DataLoader
-from MI.analysis import run_with_cache, plot_attention_patterns, logit_attribution
+from MI.analysis import \
+    run_with_cache, plot_attention_patterns, logit_attribution, \
+    get_ablation_scores, run_with_cache_batch, plot_path_patching_scores
 from MI.hook_functions import *
 import analysis.plot as plot
 import shutil
 ## Evaluate a pre-trained model
 
+def generate_null_dataset(mean_dataset_path, rewrite=False):
 
+    if mean_dataset_path.exists() and not rewrite:
+        print('Mean dataset already exists.')
+        return
+    
+    _, D_val = dat.get_dataset('algebraic_noise')        
+    val_dataloader = DataLoader(D_val,batch_size=batch_size,collate_fn=lambda x:dat.make_biml_batch(x,D_val.langs),
+                                shuffle=False)
+    langs = D_val.langs
+    net = HookedBIML(emb_size, input_size, output_size,
+        langs['input'].PAD_idx, langs['output'].PAD_idx,
+        nlayers_encoder=nlayers_encoder, nlayers_decoder=nlayers_decoder, 
+        dropout_p=dropout_p, activation=myact, ff_mult=ff_mult)        
+    net.load_state_dict(nets_state_dict)
+    net = net.to(device=DEVICE)
+
+    cache = run_with_cache_batch(val_dataloader, net, langs, wanted_hooks=['*hook*'])
+    torch.save(cache, mean_dataset_path)
+    print('Generated and saved mean dataset at', mean_dataset_path)
+
+    return
 
 if __name__ == "__main__":
 
@@ -64,7 +87,7 @@ if __name__ == "__main__":
         make_plots = args.make_plots #ADDED CODE
 
         project_dir = Path(os.getcwd())
-        model_path = project_dir / 'out_models' / 'net-HookedBIML.pt'
+        model_path = project_dir / 'out_models' / 'net-HookedBIMLSmall.pt'
         if not model_path.exists():
              raise Exception('filename '+model_path+' not found')
 
@@ -103,17 +126,18 @@ if __name__ == "__main__":
         ### ADDED CODE
         # iterate though all test cases and create a plot folder for each case
 
-        case_path = project_dir / 'my_data' / '2'
-        # TODO Draw model diagram
-        # TODO Although models doesn't match, I can write utility functions first
-        plot_dir = case_path / 'plots'
 
-
+        # construct mean activity dataset
+        null_dataset_path = project_dir / 'my_data' / 'null_dataset.pt'
+        generate_null_dataset(mean_dataset_path=null_dataset_path, rewrite=0)
 
         # Load validation dataset
-        _,val_datasets = dat.get_dataset(episode_type, **{'case': case_path})
-        assert len(val_datasets) in [1,2]
-        langs = val_datasets[0].langs
+        episode_type = 'my_test'
+
+        # case_path = project_dir / 'my_data' / 'val'
+        case_path = project_dir / 'my_data'
+        _,val_dataset = dat.get_dataset(episode_type, **{'case': case_path})
+        langs = val_dataset.langs
         assert_consist_langs(langs, checkpoint['langs'])
 
         # Load model parameters         
@@ -125,31 +149,49 @@ if __name__ == "__main__":
         net = net.to(device=DEVICE)
         describe_model(net)
 
-        activations = []
-        batch_records = []
 
         do_plot_attn = 1
         do_logit_attribution = 1
-        for val_episode in val_datasets:
-            #...............................................
-            val_dataloader = DataLoader(val_episode,batch_size=batch_size,
-                                collate_fn=lambda x:dat.make_biml_batch(x,langs),shuffle=False)
-            
-            logits, tokens, cache = run_with_cache(val_dataloader, net, langs, max_length_eval, eval_type='max', hook_names=['out_hook','z_hook','attn_weight_hook'])
-            
-            if do_plot_attn:
-                plot_attention_patterns(net, tokens, cache)
-            
-            if do_logit_attribution:
-                logit_attribution(net, cache, langs=langs)
+        plot_dir = case_path / 'plots'
 
-
-        plot_dir.mkdir(parents=True, exist_ok=True)
+        # for k,v in net.named_modules():
+        #     print(k)
+        #...............................................
+        val_dataloader = DataLoader(val_dataset, batch_size=batch_size,
+                            collate_fn=lambda x:dat.make_biml_batch(x,langs),shuffle=False)
         
-        if make_plots:
-            kwargs = {
-                'plot_diff': False,
-                'plot_inv': False,
-            }
-            make_attn_plots(plot_dir, activations, batch_records, type_ = 'self', module_ = 'encoder', averaged = averaged_weights, **kwargs)
-            make_attn_plots(plot_dir, activations, batch_records, type_ = 'multihead', module_ = 'decoder', averaged = averaged_weights, **kwargs)
+        path_patching_scores = plot_path_patching_scores(val_dataloader, net, langs,
+                                                            null_dataset_path=null_dataset_path,
+                                                            circuits=[
+                                                            # {
+                                                            # 'sender':['*encoder*z*hook*'],
+                                                            # 'receiver':['*decoder_hook*'],
+                                                            # 'freeze':['*encoder*z_hook*']
+                                                            # },
+                                                            {
+                                                            'sender':['*decoder*z*hook*'],
+                                                            'receiver':['*decoder_hook*'],
+                                                            'freeze':['*decoder*z_hook*']
+                                                            }],
+                                                            save_path=plot_dir/'path_patching'/'patching_no_freeze_mlp.png',
+                                                        # save_path=plot_dir/'path_patching'/'ablation.png',
+
+                                                            rewrite=1,
+                                                        )
+
+                                                        
+        if do_plot_attn:
+            plot_attention_patterns(val_dataloader, net, langs, save_dir=plot_dir, rewrite=0)
+
+        # if do_logit_attribution:
+        #     logit_attribution(val_dataloader, net, langs, save_dir=plot_dir, rewrite=1)
+
+
+
+            
+
+            
+
+
+
+

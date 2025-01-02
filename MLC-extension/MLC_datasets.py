@@ -35,11 +35,7 @@ def get_dataset(episode_type, **kwargs):
     if episode_type == 'my_test': # make a dataset for each txt file in the directory
         #input_symbols = ['grog', 'noot', 'pit', 'lep']
         D_train = []
-        case_dir = kwargs.get('case', None)
-        episode_files = os.listdir(case_dir / 'val')
-        D_val = []
-        for episode in episode_files:
-            D_val.append(DataAlgSingleEpisode(mode='val',episode_path=case_dir/'val'/episode))
+        D_val=DataAlg('val', mydir=kwargs.get('case'), inc_support_in_query=False)
     elif episode_type == 'retrieve': # BIML (copy only) training
         D_train = DataRetrieve('train',mydir='data_algebraic', min_ns=14, max_ns=14)
         D_val = DataRetrieve('val',mydir='data_algebraic', min_ns=14, max_ns=14)
