@@ -78,12 +78,14 @@ def build_hook_func(hook_name:dict, activation_cache=None, mode='cache', patch_a
             
                 # patch could be [1, d_head] from null_dataset
                 # or [batch, n_head, seq, d_head] from cache
+                
                 if activation.ndim != patch_activation.ndim:
                     patch_activation = einops.repeat(patch_activation, '1 c -> b 1 w c', 
                                                     b=activation.shape[0], 
                                                     w=activation.shape[2])
 
                 activation[:,head,:,:] = patch_activation.squeeze(1)[:, :activation.shape[2], :]
+
             else:
                 if activation.ndim != patch_activation.ndim:
                     # TODO need a more elegant solution
@@ -104,11 +106,50 @@ def build_hook_func(hook_name:dict, activation_cache=None, mode='cache', patch_a
         return hook_func
 
 
-def regex_match(a:str, b:str):
-# Convert wildcard pattern `b` into regex
-    regex = "^" + re.escape(b).replace(r'\*', '.*') + "$"
-    return re.fullmatch(regex, a) is not None
+# def regex_match(a:str, b:str):
+# # Convert wildcard pattern `b` into regex
+#     a, b = str(a), str(b)
+#     regex = "^" + re.escape(b).replace(r'\*', '.*') + "$"
+#     return re.fullmatch(regex, a) is not None
 
+def regex_match(a: str, b: str) -> bool:
+    """
+    Match two strings, supporting wildcards (*) and OR expressions in parentheses (a|b).
+    
+    Args:
+        a: The string to match against
+        b: The pattern, which can contain wildcards (*) and OR expressions (x|y)
+    
+    Examples:
+        >>> regex_match("1", "(1|2)")  # True
+        >>> regex_match("2", "(1|2)")  # True
+        >>> regex_match("3", "(1|2)")  # False
+        >>> regex_match("test1", "test(1|2)")  # True
+        >>> regex_match("foo", "f(o|a)*")  # True
+    """
+    a, b = str(a), str(b)
+    
+    # Helper function to process the pattern
+    def process_pattern(pattern: str) -> str:
+        # First escape all special regex characters
+        escaped = re.escape(pattern)
+        
+        # Unescape the special characters we want to support
+        escaped = escaped.replace(r'\(', '(')  # Allow parentheses
+        escaped = escaped.replace(r'\)', ')')
+        escaped = escaped.replace(r'\|', '|')  # Allow OR operator
+        escaped = escaped.replace(r'\*', '.*')  # Allow wildcards
+        
+        return f"^{escaped}$"
+    
+    # Create the regex pattern
+    regex = process_pattern(b)
+    
+    try:
+        return re.fullmatch(regex, a) is not None
+    except re.error:
+        # Handle invalid regex patterns gracefully
+        return False
 def add_hooks(net, mode='cache', hook_names:list[dict]=None, patch_activation:list[np.ndarray]|None=None):
     activation_cache = ActivationCache()
     hooked_modules = []

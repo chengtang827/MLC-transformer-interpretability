@@ -9,6 +9,9 @@ import matplotlib.pyplot as plt
 from MI.hook_functions import regex_match
 from tqdm import tqdm
 from matplotlib.colors import TwoSlopeNorm
+import multiprocessing
+import concurrent
+import re
 
 MAX_LENGTH_EVAL = 10
 max_length = MAX_LENGTH_EVAL
@@ -106,78 +109,6 @@ def eval_model(val_batch, net, langs):
     return out
 
 
-    attention_dir = save_dir / 'attention'
-    attention_dir.mkdir(parents=True, exist_ok=True)
-
-    n_head = net.nhead
-    nlayers_encoder = net.nlayers_encoder
-    nlayers_decoder = net.nlayers_decoder
-
-    # support_tokens = cache['xq_context']
-    # pred_tokens = cache['yq_predict']
-
-    val_batch = next(iter(val_dataloader))
-    attention_names = get_module_names_by_regex(net, ['*attn_weight*'])
-    cache, attn_modules = hook_functions.add_hooks(net, mode='cache', hook_names=attention_names)
-    out = eval_model(val_batch, net, langs)
-
-    support_tokens = val_batch['xq_context'][-1]
-    support_tokens.append('EOS')
-    pred_tokens = out['yq_predict'][-1]
-
-    [attn_module.remove_hooks() for attn_module in attn_modules]
-
-
-    cmap='hot'
-    encoder_self_attn_path = attention_dir / 'encoder_self_attn.png'
-    if (not encoder_self_attn_path.exists()) or rewrite:
-        fig, ax= plt.subplots(nlayers_encoder, n_head, figsize=(3.2*n_head, 3.2*nlayers_encoder),constrained_layout = True)
-        for l in range(nlayers_encoder):
-            for h in range(n_head):
-                key_string = f"{{'module': 'transformer.encoder.layers.{l}.self_attn.attn_weight_hook', 'head': {h}}}"
-                ax_i = ax[nlayers_encoder-l-1,h] # reverse the order
-                ax_i.imshow(cache.cache[key_string][-1,0,:len(support_tokens), :len(support_tokens)].squeeze(), cmap=cmap)
-                ax_i.set_title(f'Encoder L {l} H {h}')
-                ax_i.set_yticks(list(range(len(support_tokens))))
-                ax_i.set_xticks(list(range(len(support_tokens))))
-                ax_i.set_yticklabels(support_tokens, fontsize=5)
-                ax_i.set_xticklabels(support_tokens, rotation =90, fontsize=5)
-        fig.savefig(encoder_self_attn_path, dpi = 400)
-        print(f'{encoder_self_attn_path} saved')
-
-    decoder_cross_attn_path = attention_dir / 'decoder_cross_attn.png'
-    if (not decoder_cross_attn_path.exists()) or rewrite:
-        fig, ax= plt.subplots(nlayers_decoder, n_head, figsize=(3.2*n_head, 3.2*nlayers_decoder),constrained_layout = True)
-        for l in range(nlayers_decoder):
-            for h in range(n_head):
-                key_string = f"{{'module': 'transformer.decoder.layers.{l}.multihead_attn.attn_weight_hook', 'head': {h}}}"
-
-                ax_i = ax[nlayers_decoder-l-1,h]
-                ax_i.imshow(cache.cache[key_string][-1,0,:len(pred_tokens), :len(support_tokens)].squeeze(), cmap=cmap)
-                ax_i.set_title(f'Decoder L {l} H {h}')
-                ax_i.set_yticks(list(range(len(pred_tokens))))
-                ax_i.set_xticks(list(range(len(support_tokens))))
-                ax_i.set_yticklabels(pred_tokens, fontsize=5)
-                ax_i.set_xticklabels(support_tokens, rotation =90, fontsize=5)
-        fig.savefig(decoder_cross_attn_path, dpi = 400)
-        print(f'{decoder_cross_attn_path} saved')
-
-    decoder_self_attn_path = attention_dir / 'decoder_self_attn.png'
-    if (not decoder_self_attn_path.exists()) or rewrite:
-        fig, ax= plt.subplots(nlayers_decoder, n_head, figsize=(3.2*n_head, 3.2*nlayers_decoder),constrained_layout = True)
-        for l in range(nlayers_decoder):
-            for h in range(n_head):
-                key_string = f"{{'module': 'transformer.decoder.layers.{l}.self_attn.attn_weight_hook', 'head': {h}}}"
-
-                ax_i = ax[nlayers_decoder-l-1,h]
-                ax_i.imshow(cache.cache[key_string][-1,0,:len(pred_tokens), :len(pred_tokens)].squeeze(), cmap=cmap)
-                ax_i.set_title(f'Decoder L {l} H {h}')
-                ax_i.set_yticks(list(range(len(pred_tokens))))
-                ax_i.set_xticks(list(range(len(pred_tokens))))
-                ax_i.set_yticklabels(pred_tokens, fontsize=5)
-                ax_i.set_xticklabels(pred_tokens, rotation =90, fontsize=5)
-        fig.savefig(decoder_self_attn_path, dpi = 400)
-        print(f'{decoder_self_attn_path} saved')
 
 
 def plot_attention_patterns(val_dataloader, net, langs, save_dir=None, rewrite=False):
@@ -198,7 +129,7 @@ def plot_attention_patterns(val_dataloader, net, langs, save_dir=None, rewrite=F
     # pred_tokens = cache['yq_predict']
 
     val_batch = next(iter(val_dataloader))
-    attention_names = get_module_names_by_regex(net, ['*attn_weight*'])
+    attention_names = get_module_names_by_regex(net,[{'module':'*attn_weight*', 'head':'*'}])
     cache, attn_modules = hook_functions.add_hooks(net, mode='cache', hook_names=attention_names)
     out = eval_model(val_batch, net, langs)
 
@@ -250,6 +181,32 @@ def plot_attention_patterns(val_dataloader, net, langs, save_dir=None, rewrite=F
     fig.savefig(attention_path, dpi = 400)
     print(f'{attention_path} saved')
 
+def get_module_names_by_regex(net:torch.nn.Module, wanted_hooks:list[dict]):
+    wanted_names = []
+    wanted_heads = []
+    # for each dictionary of wanted hooks
+    for module_dict in wanted_hooks: 
+        wanted_name = module_dict.get('module', None)
+        wanted_head = module_dict.get('head', None)
+        for net_name, net_module in net.named_modules():
+            if regex_match(net_name, wanted_name):
+                wanted_names.append(net_name)
+                wanted_heads.append(wanted_head)
+                continue
+
+
+    expanded_names = []
+    modules_to_expand = ['q_hook','k_hook','v_hook','z_hook', 'attn_weight']
+    for wanted_name, wanted_head in zip(wanted_names, wanted_heads):
+        if any([module in wanted_name for module in modules_to_expand]):
+            for h in range(net.nhead):
+                if regex_match(str(h), wanted_head):
+                    expanded_names.append({'module':wanted_name, 'head':h})
+        else:
+            expanded_names.append({'module':wanted_name})
+        
+    return expanded_names
+
 
 
 def get_activations_by_name(cache: dict, hook_names:tuple):
@@ -268,12 +225,15 @@ def get_activations_by_name(cache: dict, hook_names:tuple):
     return names, activations
 
 
-def apply_ln_to_stack(act_before_ln:np.ndarray, ln:torch.nn.LayerNorm, stack_activations:list[np.ndarray]):
-    mu = np.mean(act_before_ln, axis=1, keepdims=True)
-    sigma = np.std(act_before_ln, axis=1, keepdims=True)
+def apply_ln_to_stack(act_before_ln:np.ndarray, ln:torch.nn.LayerNorm, stack_activations:list[np.ndarray],axis=None):
+
+    mu = np.mean(act_before_ln, axis=axis, keepdims=True)
+    sigma = np.std(act_before_ln, axis=axis, keepdims=True)
     gamma = ln.weight.detach().cpu().numpy()
     beta = ln.bias.detach().cpu().numpy()
     stack_activations_ln = [(act-mu)/sigma*gamma+beta for act in stack_activations]
+    # stack_activations_ln = [(act)/sigma*gamma for act in stack_activations]
+
     return stack_activations_ln
 
 
@@ -469,7 +429,6 @@ def run_with_cache_batch(val_dataloader, net, langs, wanted_hooks=None):
     # Add retreival hooks
     wanted_hooks_list = get_module_names_by_regex(net, wanted_hooks)
     cache, _ = hook_functions.add_hooks(net, mode='cache', hook_names=wanted_hooks_list)
-    logit = None
     cache_mean = {}
     n_batch = 0
     for _, val_batch in enumerate(val_dataloader): # each batch
@@ -483,12 +442,11 @@ def run_with_cache_batch(val_dataloader, net, langs, wanted_hooks=None):
                 # can't average over attention maps with different sizes
                 continue
 
-            v_np = v.detach().cpu().numpy()
             if k not in cache_mean:
-                cache_mean[k] = [v_np.mean(axis=(0,-2))]
+                cache_mean[k] = [v.mean(axis=(0,-2))]
             else:
-                cache_mean[k].append(v_np.mean(axis=(0,-2)))
-            print(k, v_np.shape, cache_mean[k][-1].shape)
+                cache_mean[k].append(v.mean(axis=(0,-2)))
+            print(k, v.shape, cache_mean[k][-1].shape)
         
         n_batch += 1
         print(n_batch)
@@ -499,32 +457,18 @@ def run_with_cache_batch(val_dataloader, net, langs, wanted_hooks=None):
     return cache_mean
 
 
-def get_module_names_by_regex(net:torch.nn.Module, wanted_hooks:list[str]):
-    module_names = []
-    for name, module in net.named_modules():
-        if any(regex_match(name, wanted) for wanted in wanted_hooks):
-            module_names.append(name)
 
-    expanded_names = []
-    modules_to_expand = ['z_hook', 'attn_weight']
-    for name in module_names:
-        if any([module in name for module in modules_to_expand]):
-            for h in range(net.nhead):
-                expanded_names.append({'module':name, 'head':h})
-        else:
-            expanded_names.append({'module':name})
-        
-    return expanded_names
-
-
-def plot_heatmap(data, xticklabels, yticklabels, cmap='coolwarm', title=None):
+def plot_heatmap(data, xticklabels, yticklabels, cmap='coolwarm', title=None, balance=True):
     fig, ax = plt.subplots(1,1)
 
     data = np.flipud(data)
     yticklabels = yticklabels[::-1]
     extreme = np.max(np.abs(data))
     norm = TwoSlopeNorm(vmin=-extreme, vcenter=0, vmax=extreme)
-    handle=ax.imshow(data, cmap=cmap, norm=norm)
+    if balance:
+        handle=ax.imshow(data, cmap=cmap, norm=norm)
+    else:
+        handle=ax.imshow(data, cmap=cmap)
     fig.colorbar(handle, ax=ax)  # Associate the colorbar with the Axes
     ax.set_title(title)
     ax.set_xticks(np.arange(len(xticklabels)))
@@ -599,7 +543,7 @@ def get_ablation_scores(val_dataloader, net, langs, save_dir,
 
 def plot_path_patching_scores(val_dataloader, net, langs, rewrite=1,
                              null_dataset_path=None,
-                             circuits: list[dict]={},
+                             circuit: dict={},
                              save_path=None):
     
     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -607,99 +551,232 @@ def plot_path_patching_scores(val_dataloader, net, langs, rewrite=1,
     if save_path.exists() and not rewrite:
         return
 
-    metric_circuit = []
-    ylabels_circuit = []
-    for i_circuit, circuit in enumerate(circuits):
-        sender_hooks = circuit['sender']
-        receiver_hooks = circuit['receiver']
-        freeze_hooks = circuit['freeze']
-        
-        # list senders
-        sender_names = get_module_names_by_regex(net, sender_hooks)
-        receiver_names = get_module_names_by_regex(net, receiver_hooks)
-        freeze_names = get_module_names_by_regex(net, freeze_hooks)
+    null_activations = torch.load(null_dataset_path)
+    # perma_ablate_names = get_module_names_by_regex(net, 
+    #                                                [{'module':'*encoder*layer*0*z_hook*','head':'3'},
+    #                                                 {'module':'*encoder*layer*0*z_hook*','head':'4'}
+    #                                                 ])
 
-        # clean input
-        val_batch = next(iter(val_dataloader))
+    # metric = []
+    # ylabels = []
 
-        #------first run------
-        # forward clean run
-        all_hook_names = get_module_names_by_regex(net, ['*hook*'])
-        cache_clean, hooked_cache_modules = hook_functions.add_hooks(net, mode='cache', hook_names=all_hook_names)
-        output_clean = eval_model(val_batch, net, langs)
-        # logits_clean = output_clean['logits_correct']  
-        loss_clean = output_clean['loss'] 
-        [hooked_module.remove_hooks() for hooked_module in hooked_cache_modules]
+    sender_hooks = circuit['sender']
+    receiver_hooks = circuit['receiver']
+    freeze_hooks = circuit['freeze']
+    knockout_hooks = circuit.get('knockout', [])
 
-        # get corrupted activation at the sender    
-        null_activations = torch.load(null_dataset_path)
+    # list senders
+    sender_names = get_module_names_by_regex(net, sender_hooks)
+    receiver_names = get_module_names_by_regex(net, receiver_hooks)
+    freeze_names = get_module_names_by_regex(net, freeze_hooks)
+    knockout_names = get_module_names_by_regex(net, knockout_hooks)
 
-        #------second run------
+    # clean input
+    val_batch = next(iter(val_dataloader))
+
+    #------first run------
+    # forward clean run
+    all_hook_names = get_module_names_by_regex(net, [{'module':'*hook*', 'head':'*'}])
+    cache_clean, hooked_cache_modules = hook_functions.add_hooks(net, mode='cache', hook_names=all_hook_names)
+    output_clean = eval_model(val_batch, net, langs)
+    # logits_clean = output_clean['logits_correct']  
+    loss_clean = output_clean['loss'] 
+    [hooked_module.remove_hooks() for hooked_module in hooked_cache_modules]
+
+    # get corrupted activation at the sender    
+
+    #------second run------
+    
+    loss_diff = []
+    pred_tokens_patch = []
+
+
+
+    for i in tqdm(range(len(sender_names))):
         # patch corrupted activation at the sender
-        logits_diff = []
-        loss_diff = []
-        for i in tqdm(range(len(sender_names))):
-            sender_name = [sender_names[i]]
-            corrupt_sender_activation = [null_activations[str(sender_names[i])]]
-            _, sender_modules = hook_functions.add_hooks(net, mode='patch', hook_names=sender_name, 
-                                                        patch_activation=corrupt_sender_activation)
+        sender_name = [sender_names[i]]
+        corrupt_sender_activation = [null_activations[str(name)] for name in sender_name]
+        _, sender_modules = hook_functions.add_hooks(net, mode='patch', hook_names=sender_name, 
+                                                    patch_activation=corrupt_sender_activation)
 
-            # patch clean activations to the freeze hooks
-            # remove senders from frozen hooks
-            freeze_names_no_sender = [name for name in freeze_names if name not in sender_name]
-            clean_freeze_activation = [cache_clean.cache[str(name)] for name in freeze_names_no_sender]
-            _, freeze_modules = hook_functions.add_hooks(net, mode='patch', hook_names=freeze_names_no_sender,
-                                                        patch_activation=clean_freeze_activation)
-            
-            output_patch = eval_model(val_batch, net, langs)
-            logits_patch = output_patch['logits_correct']
-            loss_patch = output_patch['loss'][-1]
-            [hooked_module.remove_hooks() for hooked_module in sender_modules+freeze_modules]
-            
-
-            loss_diff.append(loss_patch-loss_clean)
-            # loss_diff.append((output_patch['cross_entropy_loss'][-1,:]-output_clean['cross_entropy_loss'][-1,:]))
-
-            # logits_diff.append((np.exp(output_patch['logits']) - np.exp(output_clean['logits']))/np.exp(output_clean['logits']))
-            # logits_diff.append(logits_patch - logits_clean)
-
-        # list all the hooks to be ablated
-        #------third run------
-        # TODO later implement the 3rd run with the receiver hooks
-
-        # logits_diff = np.stack(logits_diff, axis=0)
-        loss_diff = np.stack(loss_diff, axis=0) # n_hooks n_batch n_seq
-
-        nhead = net.nhead
-        nlayers_encoder = net.nlayers_encoder
-        nlayers_decoder = net.nlayers_decoder
-
-        # only the first token
-        loss_diff = loss_diff[:,:,0].mean(axis=1)
-        # logits_diff = logits_diff[:,0]
-        loss_diff = einops.rearrange(loss_diff, ' (n_layer n_head) -> n_layer n_head', n_head=nhead)
-        # logits_diff = einops.rearrange(logits_diff, ' (n_layer n_head) -> n_layer n_head', n_head=nhead)
-
-        if 'encoder' in sender_hooks[0]:
-            ylabels = [f'Encoder Layer {i} Self' for i in range(nlayers_encoder)]
-        elif 'decoder' in sender_hooks[0]:
-            ylabels = []
-            for i in range(nlayers_decoder):
-                ylabels.append(f'Decoder Layer {i} Self')
-                ylabels.append(f'Decoder Layer {i} Cross')
+        # patch clean activations to the freeze hooks
+        # need to remove senders and receiver from frozen hooks
+        freeze_names_exclusive = [name for name in freeze_names if name not in sender_name+receiver_names+knockout_names]
+        clean_freeze_activation = [cache_clean.cache[str(name)] for name in freeze_names_exclusive]
+        _, freeze_modules = hook_functions.add_hooks(net, mode='patch', hook_names=freeze_names_exclusive,
+                                                    patch_activation=clean_freeze_activation)
         
-        ylabels_circuit.append(ylabels)
-        metric_circuit.append(loss_diff)
+        # knockout patch
+        _, knockout_modules = hook_functions.add_hooks(net, mode='patch', hook_names=knockout_names, 
+                                       patch_activation=[null_activations[str(name)] for name in knockout_names])
+        
+        # cache the receiver activations
+        cache_receiver, receiver_modules = hook_functions.add_hooks(net, mode='cache', hook_names=receiver_names)
 
-    metric_circuit = np.concatenate(metric_circuit, axis=0)
-    ylabels_circuit = np.concatenate(ylabels_circuit, axis=0)
+        output_patch = eval_model(val_batch, net, langs)
+        loss_patch = output_patch['loss'][-1]
+        [hooked_module.remove_hooks() for hooked_module in sender_modules+freeze_modules+knockout_modules+receiver_modules]
+        
+
+
+        #------third run------
+        patched_receiver_activation = [cache_receiver.cache[str(name)] for name in receiver_names]
+        # patch the receiver activations
+        _, receiver_modules = hook_functions.add_hooks(net, mode='patch', hook_names=receiver_names,
+                                                    patch_activation=patched_receiver_activation)
+        
+        # patch clean activations to the freeze hooks
+        freeze_names_exclusive = [name for name in freeze_names if name not in receiver_names+knockout_names]
+        clean_freeze_activation = [cache_clean.cache[str(name)] for name in freeze_names_exclusive]
+        _, freeze_modules = hook_functions.add_hooks(net, mode='patch', hook_names=freeze_names_exclusive,
+                                            patch_activation=clean_freeze_activation)
+        
+        # knockout patch
+        _, knockout_modules = hook_functions.add_hooks(net, mode='patch', hook_names=knockout_names,
+                                        patch_activation=[null_activations[str(name)] for name in knockout_names])
+                                                       
+
+        output_patch = eval_model(val_batch, net, langs)
+        loss_patch = output_patch['loss'][-1]
+
+        [hooked_module.remove_hooks() for hooked_module in receiver_modules+freeze_modules+knockout_modules]
+
+        pred_tokens_patch.append(output_patch['yq_predict'])
+        loss_diff.append(loss_patch-loss_clean)
+        
+
+    # logits_diff = np.stack(logits_diff, axis=0)
+    loss_diff = np.stack(loss_diff, axis=0) # n_hooks n_batch n_seq
+
+    nhead = net.nhead
+
+
+    # only the first token
+    loss_diff = loss_diff[:,:,0].mean(axis=1)
+    print(loss_diff)
+    # logits_diff = logits_diff[:,0]
+    loss_diff = einops.rearrange(loss_diff, ' (n_layer n_head) -> n_layer n_head', n_head=nhead)
+    # logits_diff = einops.rearrange(logits_diff, ' (n_layer n_head) -> n_layer n_head', n_head=nhead)
+
+
+
+    ylabels = []
+    for sender_name in sender_names:
+        if sender_name['module'] not in ylabels:
+
+            ylabels.append(sender_name['module'])
+    
+    metric=loss_diff
+
+
     xlabels = [f'Head {i}' for i in range(loss_diff.shape[1])]
 
-    fig = plot_heatmap(data=metric_circuit,
+    fig = plot_heatmap(data=metric,
                         xticklabels=xlabels,
-                        yticklabels=ylabels_circuit,
+                        yticklabels=ylabels,
                         cmap='coolwarm',
                         title='Path Patching Scores (loss diff)')
+
+    fig.savefig(save_path, dpi = 400)
+    print(f'{save_path} saved')
+
+
+
+
+def vector_alignment_circuit(val_dataloader, net, langs, rewrite=1,
+                             null_dataset_path=None,
+                             circuit: dict={},
+                             save_path=None):
+    
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if save_path.exists() and not rewrite:
+        return
+
+    # null_activations = torch.load(null_dataset_path)
+
+
+    sender_hooks = circuit['sender']
+    # receiver_hooks = circuit['receiver']
+    # freeze_hooks = circuit['freeze']
+    # knockout_hooks = circuit.get('knockout', [])
+
+    # list senders
+    sender_names = get_module_names_by_regex(net, sender_hooks)
+    # receiver_names = get_module_names_by_regex(net, receiver_hooks)
+    # freeze_names = get_module_names_by_regex(net, freeze_hooks)
+    # knockout_names = get_module_names_by_regex(net, knockout_hooks)
+
+    # clean input
+    val_batch = next(iter(val_dataloader))
+
+    #------first run------
+    # forward clean run
+    all_hook_names = get_module_names_by_regex(net, [{'module':'*hook*', 'head':'*'}])
+    cache, hooked_cache_modules = hook_functions.add_hooks(net, mode='cache', hook_names=all_hook_names)
+    output = eval_model(val_batch, net, langs)
+    # logits_clean = output_clean['logits_correct']  
+    loss_clean = output['loss'] 
+    [hooked_module.remove_hooks() for hooked_module in hooked_cache_modules]
+    
+    # get the first attended tokens for each episode
+    n_batch = len(output['yq_predict'])
+    n_head = net.nhead
+    d_head = net.hidden_size // n_head
+    pred_tokens = [yq[1] for yq in output['yq_predict']] # exclude SOS token in this analysis
+    token_ids = [langs['output'].symbol2index[t] for t in pred_tokens]
+
+    # define target vectors for each episode
+    unembed = net.out.weight.detach().cpu().numpy() # n_vocab x hidden_size
+    target_vectors = unembed[token_ids, :] # n_batch x hidden_size
+
+    # find the last layer norm
+    ln = net.transformer.decoder.norm
+    resid_before_ln_hook = get_module_names_by_regex(net, [{'module':f'*decoder*layer*{net.nlayers_decoder-1}*resid_post_hook*'}])
+    resid_before_ln = cache.cache[str(resid_before_ln_hook[0])].squeeze() # n_batch x seq x d_model
+
+
+    metric = []
+    # for each sender, get the transformed vectors before the target
+    for i in tqdm(range(len(sender_names))):
+        sender_name = sender_names[i]
+        Z_split = cache.cache[str(sender_name)].squeeze() # n_batch x seq x d_model
+        head = sender_name['head']
+        layer = sender_name['module'].split('.')[3]
+
+        attn_layer = '.'.join(sender_name['module'].split('.')[:-1])
+        attn_layer = re.sub(r'\.layers\.(\d+)\.', r'.layers[\1].', attn_layer)
+
+        O_weight = eval(f'net.{attn_layer}.out_proj.weight.detach().cpu().numpy()') # d_model x d_model
+
+        O_split = einops.rearrange(O_weight, 'd_model (n_head d_head) -> d_model n_head d_head', n_head=n_head, d_head=d_head)
+        O_split = O_split[:, head, :].squeeze() # d_model x d_head
+
+        attn_out_split = einops.einsum(Z_split, O_split, 'batch seq d_head, d_model d_head -> batch seq d_model')
+        attn_out_after_ln = apply_ln_to_stack(resid_before_ln, ln, [attn_out_split], axis=2)[0]
+
+        # only the first token
+        attn_out_after_ln = attn_out_after_ln[:, 1, :].squeeze() # n_batch x d_model
+        inner = np.einsum('bi,bi->b', attn_out_after_ln, target_vectors)
+        metric.append(inner.mean())
+
+    metric = np.stack(metric, axis=0)
+    metric = einops.rearrange(metric, ' (n_layer n_head) -> n_layer n_head', n_head=n_head)
+
+    ylabels = []
+    for sender_name in sender_names:
+        if sender_name['module'] not in ylabels:
+
+            ylabels.append(sender_name['module'])
+
+    xlabels = [f'Head {i}' for i in range(metric.shape[1])]
+
+    fig = plot_heatmap(data=metric,
+                        xticklabels=xlabels,
+                        yticklabels=ylabels,
+                        cmap='coolwarm',
+                        title='Path Patching Scores (Inner Product)',
+                        balance=False)
 
     fig.savefig(save_path, dpi = 400)
     print(f'{save_path} saved')

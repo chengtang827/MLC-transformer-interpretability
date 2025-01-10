@@ -1,10 +1,7 @@
 import torch
 
 import os
-import sys
 import argparse
-import numpy as np
-from MI import analysis
 from copy import deepcopy
 from hooked_model import HookedBIML, describe_model
 import MLC_datasets as dat
@@ -13,11 +10,14 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 from pathlib import Path
 from torch.utils.data import DataLoader
 from MI.analysis import \
-    run_with_cache, plot_attention_patterns, logit_attribution, \
-    get_ablation_scores, run_with_cache_batch, plot_path_patching_scores
+    run_with_cache, plot_attention_patterns, \
+    get_ablation_scores, run_with_cache_batch, plot_path_patching_scores,\
+    vector_alignment_circuit, get_module_names_by_regex
 from MI.hook_functions import *
 import analysis.plot as plot
-import shutil
+import MI.model2_2_analysis as model2_2_analysis
+from MI import hook_functions
+
 ## Evaluate a pre-trained model
 
 def generate_null_dataset(mean_dataset_path, rewrite=False):
@@ -134,8 +134,8 @@ if __name__ == "__main__":
         # Load validation dataset
         episode_type = 'my_test'
 
-        # case_path = project_dir / 'my_data' / 'val'
-        case_path = project_dir / 'my_data'
+        case_path = project_dir / 'my_data' 
+        # case_path = project_dir / 'my_data' / '4'
         _,val_dataset = dat.get_dataset(episode_type, **{'case': case_path})
         langs = val_dataset.langs
         assert_consist_langs(langs, checkpoint['langs'])
@@ -160,31 +160,61 @@ if __name__ == "__main__":
         val_dataloader = DataLoader(val_dataset, batch_size=batch_size,
                             collate_fn=lambda x:dat.make_biml_batch(x,langs),shuffle=False)
         
-        path_patching_scores = plot_path_patching_scores(val_dataloader, net, langs,
-                                                            null_dataset_path=null_dataset_path,
-                                                            circuits=[
-                                                            # {
-                                                            # 'sender':['*encoder*z*hook*'],
-                                                            # 'receiver':['*decoder_hook*'],
-                                                            # 'freeze':['*encoder*z_hook*']
-                                                            # },
-                                                            {
-                                                            'sender':['*decoder*z*hook*'],
-                                                            'receiver':['*decoder_hook*'],
-                                                            'freeze':['*decoder*z_hook*']
-                                                            }],
-                                                            save_path=plot_dir/'path_patching'/'patching_no_freeze_mlp.png',
-                                                        # save_path=plot_dir/'path_patching'/'ablation.png',
+        analysis = model2_2_analysis.Analysis(dataloader=val_dataloader, net=net, langs=langs, plot_dir=plot_dir,
+                                              null_dataset_path=null_dataset_path)
+                #
+        analysis.encoder_to_encoder_1_1_k(sender_names=[{'module':'*encoder*layer*0*z_hook*','head':'*'}], rewrite=1)
 
+        analysis.encoder_to_encoder_1_1_q(sender_names=[{'module':'*encoder*layer*0*z_hook*','head':'*'}], rewrite=1)
+
+
+
+
+        analysis.encoder_to_DC_1_5(sender_names=[{'module':'*encoder*z_hook*','head':'*'}], rewrite=1)
+
+        analysis.decoder_to_umembedding(sender_names=[{'module':'*decoder*z_hook*','head':'*'}], rewrite=1)
+
+
+
+
+
+
+
+        # analysis.first_token_writer(writer_names=[{'module':'*decoder*layer*1*multihead*weight*', 'head':'1'},
+        #                                         {'module':'*decoder*layer*1*multihead*v_hook*', 'head':'1'},], rewrite=1)
+
+
+        path_patching_scores = vector_alignment_circuit(val_dataloader, net, langs,
+                                                            null_dataset_path=null_dataset_path,
+                                                            circuit=
+                                                            {
+                                                            'sender':[
+                                                                 {'module':'*decoder*z_hook*','head':'*'},
+                                                                #  {'module':'*decoder*layer*1*self*z_hook*','head':'*'},
+                                                                 ],
+                                                            'receiver':[{'module':'*decoder*layer*1*multi*z_hook*','head':'1'}],
+                                                            'freeze':[
+                                                                 {'module':'*encoder*z_hook*','head':'*'},
+                                                                 {'module':'*decoder*z_hook*','head':'*'},
+                                                                ],
+                                                            'knockout':[{'module':'*encoder*layer*1*z_hook*','head':'0'}]
+                                                            },
+                                                            save_path=plot_dir/'path_patching'/'VA_decoder_to_unembed.png',
                                                             rewrite=1,
                                                         )
 
-                                                        
-        if do_plot_attn:
-            plot_attention_patterns(val_dataloader, net, langs, save_dir=plot_dir, rewrite=0)
 
-        # if do_logit_attribution:
-        #     logit_attribution(val_dataloader, net, langs, save_dir=plot_dir, rewrite=1)
+
+        if do_plot_attn:
+            null_activations = torch.load(null_dataset_path)
+            ablate_name = get_module_names_by_regex(net, [{'module':'*encoder*layer*0*z_hook*','head':'3|4|6|7'},
+                                                        #   {'module':'*encoder*layer*0*mlp_out*','head':'*'}
+                                                          ])
+            hook_functions.add_hooks(net, mode='patch', hook_names=ablate_name, 
+                                     patch_activation=[null_activations[str(name)] for name in ablate_name])
+            plot_attention_patterns(val_dataloader, net, langs, save_dir=plot_dir, rewrite=1)                                    
+
+
 
 
 

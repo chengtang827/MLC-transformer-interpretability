@@ -1717,7 +1717,7 @@ class HookedMultiheadAttention(HookedRootModule):
             q = self.q_hook(q)
             k = self.k_hook(k)
             v = self.v_hook(v)
-            z = self.scaled_dot_product_attention(q, k, v, attn_mask, dropout_p, is_causal)
+            z = self.scaled_dot_product_attention(q, k, v, attn_mask, dropout_p, is_causal) # batch n_head seq d_head
             z = z.permute(2, 0, 1, 3).contiguous().view(bsz * tgt_len, embed_dim)
 
             result = linear(z, out_proj_weight, out_proj_bias)
