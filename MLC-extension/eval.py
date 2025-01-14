@@ -134,11 +134,10 @@ if __name__ == "__main__":
         # Load validation dataset
         episode_type = 'my_test'
 
-        case_path = project_dir / 'my_data' 
-        # case_path = project_dir / 'my_data' / '4'
+        # case_path = project_dir / 'my_data' 
+        case_path = project_dir / 'my_data' / '4'
         _,val_dataset = dat.get_dataset(episode_type, **{'case': case_path})
         langs = val_dataset.langs
-        assert_consist_langs(langs, checkpoint['langs'])
 
         # Load model parameters         
         net = HookedBIML(emb_size, input_size, output_size,
@@ -162,26 +161,20 @@ if __name__ == "__main__":
         
         analysis = model2_2_analysis.Analysis(dataloader=val_dataloader, net=net, langs=langs, plot_dir=plot_dir,
                                               null_dataset_path=null_dataset_path)
-                #
-        analysis.encoder_to_encoder_1_1_k(sender_names=[{'module':'*encoder*layer*0*z_hook*','head':'*'}], rewrite=1)
-
-        analysis.encoder_to_encoder_1_1_q(sender_names=[{'module':'*encoder*layer*0*z_hook*','head':'*'}], rewrite=1)
+        
 
 
+        # plot_attention_patterns(val_dataloader, net, langs, save_dir=plot_dir, rewrite=1)     
 
 
-        analysis.encoder_to_DC_1_5(sender_names=[{'module':'*encoder*z_hook*','head':'*'}], rewrite=1)
+        analysis.build_graph()
+        # for pred_arg in range(3):
+        circuit = analysis.back_track(pred_arg=0, plot_score=0, rewrite=1)
 
-        analysis.decoder_to_umembedding(sender_names=[{'module':'*decoder*z_hook*','head':'*'}], rewrite=1)
-
-
+        output = analysis.run_minimal_circuit(circuit, rewrite=1)
 
 
 
-
-
-        # analysis.first_token_writer(writer_names=[{'module':'*decoder*layer*1*multihead*weight*', 'head':'1'},
-        #                                         {'module':'*decoder*layer*1*multihead*v_hook*', 'head':'1'},], rewrite=1)
 
 
         path_patching_scores = vector_alignment_circuit(val_dataloader, net, langs,
@@ -205,19 +198,16 @@ if __name__ == "__main__":
 
 
 
+                             
+
         if do_plot_attn:
             null_activations = torch.load(null_dataset_path)
-            ablate_name = get_module_names_by_regex(net, [{'module':'*encoder*layer*0*z_hook*','head':'3|4|6|7'},
-                                                        #   {'module':'*encoder*layer*0*mlp_out*','head':'*'}
+            ablate_name = get_module_names_by_regex(net, [{'module':'*encoder*layer*1*z_hook*','head':'1|2|3|4|5|6|7'},
+                                                        #   {'module':'*decoder*layer*0*multi*z_hook*','head':'1|5'}
                                                           ])
             hook_functions.add_hooks(net, mode='patch', hook_names=ablate_name, 
                                      patch_activation=[null_activations[str(name)] for name in ablate_name])
-            plot_attention_patterns(val_dataloader, net, langs, save_dir=plot_dir, rewrite=1)                                    
-
-
-
-
-
+            plot_attention_patterns(val_dataloader, net, langs, save_dir=plot_dir, rewrite=1)     
             
 
             

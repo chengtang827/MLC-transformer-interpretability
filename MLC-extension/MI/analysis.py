@@ -207,6 +207,12 @@ def get_module_names_by_regex(net:torch.nn.Module, wanted_hooks:list[dict]):
         
     return expanded_names
 
+def get_activations_by_regex(net, cache: dict, hook_regex:list[dict]):
+    hook_names = get_module_names_by_regex(net, hook_regex)
+    activations = []
+    for hook_name in hook_names:
+        activations.append(cache.cache[str(hook_name)])
+    return activations
 
 
 def get_activations_by_name(cache: dict, hook_names:tuple):
