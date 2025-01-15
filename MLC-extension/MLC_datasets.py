@@ -192,7 +192,7 @@ def make_biml_batch(samples, langs):
     assert isinstance(samples,list)
     m = len(samples)
     mybatch = {}
-    mybatch['list_samples'] = samples
+    mybatch['list_samples'] = []
     mybatch['batch_size'] = m
     mybatch['xq_context'] = [] # list of source sequences (as lists) across all episodes
     mybatch['xq'] = []  # list of queries (as lists) across all episodes
@@ -208,6 +208,7 @@ def make_biml_batch(samples, langs):
         mybatch['yq'] += sample['yq']
         mybatch['q_idx'] += [idx*torch.ones(nq, dtype=torch.int)]
         mybatch['in_support'] += [x in sample['xs'] for x in sample['xq']]
+        mybatch['list_samples'] += [sample]*nq
     mybatch['q_idx'] = torch.cat(mybatch['q_idx'], dim=0)
     mybatch['xq_context_padded'],mybatch['xq_context_lengths'] = build_padded_tensor(mybatch['xq_context'], langs['input'])
     mybatch['yq_padded'],mybatch['yq_lengths'] = build_padded_tensor(mybatch['yq'], langs['output'])

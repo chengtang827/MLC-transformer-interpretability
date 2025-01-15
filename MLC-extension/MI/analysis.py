@@ -100,8 +100,9 @@ def eval_model(val_batch, net, langs):
     for yq in yq_predict:
         yq.insert(0, 'SOS')
     
-    out = {'yq_predict':yq_predict, 'v_acc':v_acc, 'in_support':in_support, 
+    out = {'yq':val_batch['yq'], 'yq_predict':yq_predict, 'v_acc':v_acc, 'in_support':in_support, 
             'yq_predict_cont': yq_predict_cont, 'xq_context': val_batch['xq_context'],
+            'grammar': val_batch['list_samples'],
             'logits_nvocab': logits.detach().cpu().numpy(), 
             'logits_correct': logits_correct,
             'loss': loss}
@@ -791,5 +792,88 @@ def vector_alignment_circuit(val_dataloader, net, langs, rewrite=1,
 
 
 
-    
 
+def grammar_to_dict_old(input_string):
+    """
+    Parses a string to extract mappings of words to colors and functions to outputs.
+    Produces both a forward dictionary and a reverse dictionary (color to word).
+    
+    Args:
+        input_string (str): The input string to parse.
+
+    Returns:
+        tuple: A tuple containing:
+            - forward_dict (dict): Maps words/functions to their outputs.
+            - reverse_dict (dict): Maps colors to words.
+    """
+    # Initialize the dictionaries
+    forward_dict = {}
+    reverse_dict = {}
+    function_dict = {}
+    # Split the string by lines
+    lines = input_string.strip().split('\n')
+
+    for line in lines:
+        # Match patterns for direct word-to-color mappings (e.g., "blicket -> GREEN")
+        word_color_match = re.match(r"^([\w]+) -> (\w+)$", line.strip())
+        if word_color_match:
+            word, color = word_color_match.groups()
+            forward_dict[word] = color
+
+            # Populate the reverse dictionary
+            if color not in reverse_dict:
+                reverse_dict[color] = []
+            reverse_dict[color] = word
+            continue
+
+        # Match patterns for function-to-output mappings (e.g., "x1 dax -> [x1] [x1] [x1]")
+        function_match = re.match(r"^([\w]+) ([\w]+) -> (.+)$", line.strip())
+        if function_match:
+            variable, function, output = function_match.groups()
+            function_dict[function] = output
+            continue
+
+    return forward_dict, reverse_dict, function_dict
+
+def grammar_to_dict(input_string):
+    """
+    Parses a string to extract mappings of words to colors and functions to outputs.
+    Produces both a forward dictionary and a reverse dictionary (color to word).
+    The function names will be extracted as words (e.g., 'dax', 'lug').
+
+    Args:
+        input_string (str): The input string to parse.
+
+    Returns:
+        tuple: A tuple containing:
+            - forward_dict (dict): Maps words/functions to their outputs.
+            - reverse_dict (dict): Maps colors to words.
+    """
+    # Initialize the dictionaries
+    forward_dict = {}
+    reverse_dict = {}
+    function_dict = {}
+    # Split the string by lines
+    lines = input_string.strip().split('\n')
+
+    for line in lines:
+        # Match patterns for direct word-to-color mappings (e.g., "blicket -> GREEN")
+        word_color_match = re.match(r"^([\w]+) -> (\w+)$", line.strip())
+        if word_color_match:
+            word, color = word_color_match.groups()
+            forward_dict[word] = color
+
+            # Populate the reverse dictionary
+            if color not in reverse_dict:
+                reverse_dict[color] = []
+            reverse_dict[color]= word
+            continue
+
+        # Match patterns for function-to-output mappings (e.g., "x1 dax -> [x1] [x1] [x1]")
+        function_match = re.match(r"^[\w]+ ([\w]+)(?: [\w]+)? -> (.+)$", line.strip())
+        if function_match:
+            function, output = function_match.groups()
+            function_dict[function] = output
+            continue
+
+    return forward_dict, reverse_dict, function_dict

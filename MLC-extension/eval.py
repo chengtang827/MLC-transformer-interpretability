@@ -134,8 +134,8 @@ if __name__ == "__main__":
         # Load validation dataset
         episode_type = 'my_test'
 
-        # case_path = project_dir / 'my_data' 
-        case_path = project_dir / 'my_data' / '4'
+        case_path = project_dir / 'my_data' 
+        # case_path = project_dir / 'my_data' / '4'
         _,val_dataset = dat.get_dataset(episode_type, **{'case': case_path})
         langs = val_dataset.langs
 
@@ -162,18 +162,25 @@ if __name__ == "__main__":
         analysis = model2_2_analysis.Analysis(dataloader=val_dataloader, net=net, langs=langs, plot_dir=plot_dir,
                                               null_dataset_path=null_dataset_path)
         
+        # prune_names = analysis.prune_circuit(rewrite=0)
 
 
         # plot_attention_patterns(val_dataloader, net, langs, save_dir=plot_dir, rewrite=1)     
 
+        prune_names=None
+        analysis.build_graph(prune_names=prune_names, bias=False)
 
-        analysis.build_graph()
+
+
+        analysis.analyze_dec_cross_1_5()
+
         # for pred_arg in range(3):
-        circuit = analysis.back_track(pred_arg=0, plot_score=0, rewrite=1)
+        pred_arg = 0
+        circuit = analysis.back_track(pred_arg=pred_arg, plot_score=0, prune_names=prune_names, rewrite=1)
+
+
 
         output = analysis.run_minimal_circuit(circuit, rewrite=1)
-
-
 
 
 
