@@ -1,6 +1,7 @@
 *__pycache__*
-**/data_algebraic*/**
-**/
+data_algebraic/
+
 *slurm_output*
 *__MACOSX*
-*.vscode*
+*/.vscode/*
+../Analysis

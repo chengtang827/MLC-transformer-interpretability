@@ -170,13 +170,20 @@ if __name__ == "__main__":
         prune_names=None
         analysis.build_graph(prune_names=prune_names, bias=False)
 
+        analysis.analyze_enc_self_0_6(block = 'enc',layer = 0,type = 'self', head = 7)
 
+        analysis.analyze_enc_self_1_0(block = 'enc',layer = 1,type = 'self', head = 7)
+
+        analysis.analyze_dec_cross_0_4(block = 'dec',layer = 0,type = 'cross', head = 4)
+
+        analysis.analyze_dec_self_1_3()
 
         analysis.analyze_dec_cross_1_5()
 
+
         # for pred_arg in range(3):
         pred_arg = 0
-        circuit = analysis.back_track(pred_arg=pred_arg, plot_score=0, prune_names=prune_names, rewrite=1)
+        circuit = analysis.back_track(pred_arg=pred_arg, plot_score=1, prune_names=prune_names, rewrite=1)
 
 
 
