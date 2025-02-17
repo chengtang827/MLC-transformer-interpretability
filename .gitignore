@@ -1,0 +1,16 @@
+**/__pycache__/
+**/__MACOSX/
+**/.vscode/
+**/.DS_Store
+**/slurm_output/
+**/Analysis/
+
+
+*/data_algebraic/*
+*/test_data/*
+*/org_data/*
+
+dispatch_jobs.sh
+
+*.sh
+note.txt
