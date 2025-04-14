@@ -142,6 +142,11 @@ def simplify_tokens(tokens):
 
 
 def plot_attention_patterns_by_head(dataset, net, head_kwargs, save_dir=None, rewrite=False, display=False):
+    """
+    Plot attention patterns for a specific head
+    Dataset should be a single episode with only one query.
+
+    """
 
     dataloader = dataset['dataloader']
     langs = dataset['langs']
@@ -207,6 +212,28 @@ def plot_attention_patterns_by_head(dataset, net, head_kwargs, save_dir=None, re
 
 
 def plot_attention_patterns(dataset, net, save_dir=None, rewrite=False):
+    """
+    Generate the attention patterns for the entire model (all attention heads)
+    Dataset should be a single episode with only one query.
+
+    Modify this function (add a for loop or something) to plot for multiple episodes/queries.
+    
+    Args:
+        dataset: Dictionary containing dataloader and langs
+        net: Neural network model
+        save_dir: Directory to save attention pattern plots
+        rewrite: Whether to overwrite existing plots
+    
+    The function plots attention patterns for:
+    - Encoder self-attention layers
+    - Decoder self-attention layers 
+    - Decoder cross-attention layers
+    
+    For each attention head, plots a heatmap showing attention weights between:
+    - Encoder self-attention: support tokens -> support tokens
+    - Decoder self-attention: predicted tokens -> predicted tokens  
+    - Decoder cross-attention: predicted tokens -> support tokens
+    """
 
     dataloader = dataset['dataloader']
     langs = dataset['langs']
@@ -223,8 +250,6 @@ def plot_attention_patterns(dataset, net, save_dir=None, rewrite=False):
     nlayers_encoder = net.nlayers_encoder
     nlayers_decoder = net.nlayers_decoder
 
-    # support_tokens = cache['xq_context']
-    # pred_tokens = cache['yq_predict']
 
     val_batch = next(iter(dataloader))
     attention_names = get_module_names_by_regex(net,[{'module':'*attn_weight*', 'head':'*'}])
@@ -243,6 +268,7 @@ def plot_attention_patterns(dataset, net, save_dir=None, rewrite=False):
     fig, ax= plt.subplots(nlayers_total, n_head, 
                           figsize=(3.2*n_head, 3.2*nlayers_total),
                           constrained_layout = True)
+    # Plot encoder self-attention layers
     for l in range(nlayers_encoder):
         for h in range(n_head):
             key_string = f"{{'module': 'transformer.encoder.layers.{l}.self_attn.attn_weight_hook', 'head': {h}}}"
@@ -254,10 +280,11 @@ def plot_attention_patterns(dataset, net, save_dir=None, rewrite=False):
             ax_i.set_yticklabels(support_tokens, fontsize=fontsize)
             ax_i.set_xticklabels(support_tokens, rotation =90, fontsize=fontsize)
     
+    # Plot decoder self-attention and cross-attention layers
     for l in range(nlayers_decoder):
         for h in range(n_head):
 
-
+            # Plot decoder self-attention
             key_string = f"{{'module': 'transformer.decoder.layers.{l}.self_attn.attn_weight_hook', 'head': {h}}}"
             ax_i = ax[nlayers_total-nlayers_encoder-l*2-1,h]
             ax_i.imshow(cache.cache[key_string][-1,0,:len(pred_tokens), :len(pred_tokens)].squeeze(), cmap=cmap)
@@ -267,6 +294,7 @@ def plot_attention_patterns(dataset, net, save_dir=None, rewrite=False):
             ax_i.set_yticklabels(pred_tokens, fontsize=fontsize)
             ax_i.set_xticklabels(pred_tokens, rotation =90, fontsize=fontsize)
 
+            # Plot decoder cross-attention
             key_string = f"{{'module': 'transformer.decoder.layers.{l}.multihead_attn.attn_weight_hook', 'head': {h}}}"
             ax_i = ax[nlayers_total-nlayers_encoder-l*2-2,h]
             ax_i.imshow(cache.cache[key_string][-1,0,:len(pred_tokens), :len(support_tokens)].squeeze(), cmap=cmap)

@@ -23,6 +23,17 @@ from scipy.linalg import null_space
 from sklearn.preprocessing import OneHotEncoder
 
 class ComputeNode:
+    """
+    Base class for nodes in the computation graph.
+    Has 3 subclasses: UmembeddingNode, EmbeddingNode, AttentionNode
+    
+    Attributes:
+        net: Neural network model
+        cache: Dictionary storing cached activations from model hooks
+        hooked_modules: List of hooked modules in the model
+        output: Model outputs
+        langs: Language information for tokenization
+    """
     def __init__(self, net, cache, hooked_modules, output, langs):
         self.net = net
         self.cache = cache
@@ -31,24 +42,28 @@ class ComputeNode:
         self.langs = langs
 
 class UmembeddingNode(ComputeNode):
-    def __init__(self, input_stream, unembedding_proj, module_name=None, analysis=None):
+    def __init__(self, input_stream, unembedding_proj, module_name=None, analyzer=None):
         self.module_name = module_name
         self.head = None
-        self.input_stream = input_stream
+        self.input_stream = input_stream # all direct inputs to this node
         self.logit_problem = None
-        self.unembedding_proj = unembedding_proj
-        self.analysis = analysis
 
-    def get_problems(self, weight_mask=None, arg_q=None, target_labels=None):
+        # the unembedding projection matrix
+        # each vector represents the correct unembedding vector for each output token
+        # this is used for some analysis that compares the alignment between input stream to the target unembedding vector
+        self.unembedding_proj = unembedding_proj
+
+        self.analyzer = analyzer
+
+    def get_problems(self, arg_output=None, target_labels=None):
         n_batch = self.input_stream.cached_activation.shape[0]
         problems = []
         unembedding_proj = np.tile(self.unembedding_proj,(n_batch,1,1))
 
-        # target_vectors = unembedding_proj[np.arange(n_batch), arg_source, :]
-
         self.logit_problem = Problem(source_stream=self.input_stream, target_vectors=unembedding_proj, 
-                                     weight_mask=weight_mask, arg_q=arg_q, current_node=self, analysis=self.analysis, 
+                                     arg_output=arg_output, current_node=self, analyzer=self.analyzer, 
                                      mode='out', target_labels=target_labels)
+        
         problems.append(self.logit_problem)
 
         return problems
@@ -61,6 +76,58 @@ class EmbeddingNode(ComputeNode):
 
     def get_problems(self,  **kwargs):
         return []
+
+
+class AttentionNode(ComputeNode):
+    def __init__(self, q_stream, k_stream, v_stream, attention_score, output_to_resid, module_name, head=None, analyzer=None):
+        self.module_name = module_name
+        self.head = head
+        self.analyzer = analyzer
+
+        self.q_stream = q_stream
+        self.k_stream = k_stream
+        self.v_stream = v_stream
+        self.attention_score = attention_score
+        self.output_to_resid = output_to_resid
+
+        self.q_problem = None
+        
+        self.k_problem = None
+
+        self.v_problem = None
+
+
+    def get_problems(self, arg_q=None, mode:str='qkv', prev_problem=None, target_labels=None,
+                     target_args=None):
+        
+        assert set(mode).issubset({'q','k','v'})
+        n_batch = self.q_stream.cached_activation.shape[0]
+
+        target_q = self.q_stream.cached_activation[np.arange(n_batch), 0, :, :]
+        target_k = self.k_stream.cached_activation[np.arange(n_batch), 0, :, :]
+        target_v = self.v_stream.cached_activation[np.arange(n_batch), 0, :, :] # batch seq d_model
+        attention = self.attention_score[np.arange(n_batch),0,:,:] # batch seq_q seq_k
+
+        problems = []
+        if 'q' in mode:
+            self.q_problem = Problem(source_stream=self.q_stream, target_vectors=target_k, arg_output=arg_q, 
+                                     analyzer=self.analyzer, current_node=self, mode='q', prev_problem=prev_problem, 
+                                     target_labels=target_labels, target_args=target_args)
+            problems.append(self.q_problem)
+        if 'k' in mode:
+            self.k_problem = Problem(source_stream=self.k_stream, target_vectors=target_q, arg_output=arg_q, 
+                                     analyzer=self.analyzer, current_node=self, mode='k', prev_problem=prev_problem, 
+                                     target_labels=target_labels, target_args=target_args)
+            problems.append(self.k_problem) 
+        if 'v' in mode:
+            self.v_problem = Problem(source_stream=self.v_stream, target_vectors=target_v, arg_output=arg_q, 
+                                     analyzer=self.analyzer, current_node=self, mode='v', prev_problem=prev_problem, 
+                                     target_labels=target_labels, target_args=target_args)
+            problems.append(self.v_problem)
+        
+        return problems
+
+
 
 class ActivationStream:
     def __init__(self, source_nodes, in_pipeline:list, cached_activation):
@@ -89,32 +156,69 @@ class ActivationStream:
         return nodes, outputs
 
 class Problem:
-    def __init__(self, source_stream:ActivationStream, target_vectors:np.ndarray=None, arg_q=None, weight_mask=None,  
-                 analysis=None, current_node=None, mode:str='q', prev_problem=None, target_labels=None,
-                 target_args=None):
-        self.source_stream = source_stream
-        self.arg_q = arg_q
-        self.weight_mask = weight_mask
-        self.target_vectors = target_vectors
-        self.current_node = current_node
-        self.mode = mode
-        self.analysis = analysis
-        self.prev_problem = prev_problem
-        self.target_labels = target_labels
-        self.target_args = target_args
+    '''
+    A problem is a measurement to be explained.
+    For unembedding node, the problem is the match between 
+    '''
+    def __init__(self, source_stream:ActivationStream, target_vectors:np.ndarray=None, arg_output=None,  
+                 analyzer=None, current_node=None, mode:str='q', prev_problem=None, 
+                 target_labels=None, target_args=None, weight_mask=None):
+        '''
+        source_stream: the inputs to this problem
 
-    def back_track(self, prune_names=None, metric='VAF', sequential=True, eval_func=None, ablate_all=False):
+        target_vectors: for example, the unembedding vectors for the output tokens, 
+                        which are to be matched with individual input stream
+
+        arg_output: the output tokens index of interest
+
+        analyzer: the backtrack analyzer object
+
+        current_node: the compute node that owns this problem
+
+        mode: the mode of the problem, which is 'q', 'k', 'v', or 'out', to define the current problem
+
+        prev_problem: the previous problem in the chain
+
+        weight_mask: deprecated, the attention weight for each attention node, previously used for masking only some tokens of interest
+        target_labels: deprecated
+        target_args: deprecated
+        '''
+        self.source_stream = source_stream #
+        self.target_vectors = target_vectors #
+        self.arg_output = arg_output #
+        self.analyzer = analyzer #
+        self.current_node = current_node #
+        self.mode = mode #
+        self.prev_problem = prev_problem #
+
+        self.target_labels = None # deprecated
+        self.target_args = None # deprecated
+        self.weight_mask = None # deprecated
+
+    def back_track(self, metric='loss', chained=True, eval_func=None, keep_one_only=True):
         """
-        track_n: max number of top nodes to back track
-        threshold: the minimum score to consider a node as a top node
+        Performs backtracking analysis to measure importance of source nodes.
 
-        Backtracking is different for encoder and decoder
-        if decoder, only care about the row of the current q
-        if encoder, consider all the qs
+        Args:
+            metric: Type of metric to use for scoring:
+                - 'loss': Cross entropy loss on target tokens
+                - 'logit': Raw logit values for target tokens  
+                - 'customized': Custom evaluation function
+                - 'VAF': Variance accounted for
+                - 'MI': Mutual information
+                - 'inner': Inner product similarity
+            chained: Whether to analyze full chain of problems (True) or just current problem (False)
+            eval_func: Optional custom evaluation function for 'customized' metric
+            keep_one_only: For ablation, whether to keep only one source node (True) or ablate one at a time (False)
+                - if int, will be broadcasted to the number of source nodes
+                - if list, each option will be applied to each chained step
 
-        ablate_all: if True, only keep one source node and ablate all the others
-                    if False, only ablate one source node and keep all the others
-        """ 
+        Returns:
+            source_scores: Importance scores for each source node
+            arg_output: Target token indices
+            target_labels: (Deprecated) Target labels
+            target_args: (Deprecated) Target arguments
+        """
 
         assert metric in ['MI', 'VAF', 'inner', 'loss', 'logit', 'customized']
         # list all the previous problems
@@ -153,115 +257,44 @@ class Problem:
                 }
 
                 
-                score_clean, score_patch = self.analysis.run_path_patching(circuit=circuit, 
-                                                                           sequential=sequential, 
+                score_clean, score_patch = self.analyzer.run_path_patching(circuit=circuit, 
+                                                                           chained=chained, 
                                                                            metric=metric, 
                                                                            eval_func=eval_func,
-                                                                           ablate_all=ablate_all)
+                                                                           keep_one_only=keep_one_only)
                 if metric=='loss':
-                    score_clean = np.array([score_clean[b, self.arg_q[b]] for b in range(n_batch)])
-                    score_patch = np.array([score_patch[b, self.arg_q[b]] for b in range(n_batch)])
-                    diff = (score_patch-score_clean).sum()/score_clean.sum()
+                    score_clean = np.array([score_clean[b, self.arg_output[b]] for b in range(n_batch)])
+                    score_patch = np.array([score_patch[b, self.arg_output[b]] for b in range(n_batch)])
+                    # compute the percentage change then average over the batch
+                    diff = ((score_patch-score_clean)/score_clean).mean()
 
                 elif metric=='logit':
-                    score_clean = np.array([score_clean[b][self.arg_q[b]] for b in range(n_batch)])
-                    score_patch = np.array([score_patch[b][self.arg_q[b]] for b in range(n_batch)])
+
+                    score_clean = np.array([score_clean[b][self.arg_output[b]] for b in range(n_batch)])
+                    score_patch = np.array([score_patch[b][self.arg_output[b]] for b in range(n_batch)])
                     diff = (score_patch-score_clean).sum()/score_clean.sum()
+
                 elif metric=='customized':
-                    if ablate_all:
-                        diff = score_patch/score_clean
-                    else:
-                        diff = score_clean - score_patch
+                    #show how much the score remains with this node only
+                    diff = score_patch/score_clean
 
 
+                print(f'diff: {diff}')
                 source_scores.append(diff)
             source_scores = np.array(source_scores)
         elif metric=='VAF':
-            source_scores = self.analysis.compute_VAF(problem=self)
+            source_scores = self.analyzer.compute_VAF(problem=self)
         elif metric=='MI':
-            source_scores = self.analysis.compute_MI(problem=self)
+            source_scores = self.analyzer.compute_MI(problem=self)
         elif metric=='inner':
-            source_scores = self.analysis.compute_inner(problem=self)
+            source_scores = self.analyzer.compute_inner(problem=self)
 
 
-        return source_scores, self.arg_q, self.target_labels, self.target_args
+        return source_scores, self.arg_output, self.target_labels, self.target_args
         
 
 
-class AttentionNode(ComputeNode):
-    def __init__(self, q_stream, k_stream, v_stream, attention_score, output_to_resid, module_name, head=None, analysis=None):
-        self.module_name = module_name
-        self.head = head
-        self.analysis = analysis
 
-        self.q_stream = q_stream
-        self.k_stream = k_stream
-        self.v_stream = v_stream
-        self.attention_score = attention_score
-        self.output_to_resid = output_to_resid
-
-        self.q_problem = None
-        
-        self.k_problem = None
-
-        self.v_problem = None
-
-
-    def get_problems(self, arg_q=None, mode:str='qkv', prev_problem=None, target_labels=None,
-                     target_args=None):
-        
-        assert set(mode).issubset({'q','k','v'})
-        n_batch = self.q_stream.cached_activation.shape[0]
-
-        target_q = self.q_stream.cached_activation[np.arange(n_batch), 0, :, :]
-        # argmax_k = self.attention_score[np.arange(n_batch),0,arg_q,:].argmax(-1) # batch seq_q
-        target_k = self.k_stream.cached_activation[np.arange(n_batch), 0, :, :]
-        target_v = self.v_stream.cached_activation[np.arange(n_batch), 0, :, :] # batch seq d_model
-        attention = self.attention_score[np.arange(n_batch),0,:,:] # batch seq_q seq_k
-
-
-
-        
-        problems = []
-        if 'q' in mode:
-            self.q_problem = Problem(source_stream=self.q_stream, target_vectors=target_k, weight_mask=attention, arg_q=arg_q, 
-                                     analysis=self.analysis, current_node=self, mode='q', prev_problem=prev_problem, 
-                                     target_labels=target_labels, target_args=target_args)
-            problems.append(self.q_problem)
-        if 'k' in mode:
-            self.k_problem = Problem(source_stream=self.k_stream, target_vectors=target_q, weight_mask=attention, arg_q=arg_q, 
-                                     analysis=self.analysis, current_node=self, mode='k', prev_problem=prev_problem, 
-                                     target_labels=target_labels, target_args=target_args)
-            problems.append(self.k_problem) 
-        if 'v' in mode:
-            # back propagate q_args to v_args
-            percent_attention_explained = 0.5
-
-            if target_args != None and target_args !={}:
-                q_ids = target_args['vector_ids']
-                q_labels = target_args['vector_labels']
-
-                v_dict = {}
-                for b in range(n_batch):
-                    for q_id, q_label in zip(q_ids[b], q_labels[b]):
-                        attn_k = attention[b, q_id,:]
-                        argsort_attn_k = np.argsort(attn_k)[::-1]
-                        attn_k_sorted = np.sort(attn_k)[::-1]
-                        cumsum_attn_k = np.cumsum(attn_k_sorted)
-                        v_ids = argsort_attn_k[:np.where(cumsum_attn_k>percent_attention_explained)[0][0]]
-                        v_weights = attn_k_sorted[:np.where(cumsum_attn_k>percent_attention_explained)[0][0]]
-                        for v_id, v_weight in zip(v_ids, v_weights):
-                            if v_id not in v_dict:
-                                v_dict[v_id] = [{q_label: v_weight}]
-                            else:
-                                v_dict[v_id].append({q_label: v_weight})
-            # decide the 
-            self.v_problem = Problem(source_stream=self.v_stream, target_vectors=target_v, weight_mask=attention, arg_q=arg_q, 
-                                     analysis=self.analysis, current_node=self, mode='v', prev_problem=prev_problem, 
-                                     target_labels=target_labels, target_args=target_args)
-            problems.append(self.v_problem)
-        
-        return problems
 
 class CachedLayerNorm:
     def __init__(self, resid_before_ln: np.array, ln: torch.nn.LayerNorm, axis:int=-1, bias=False):
@@ -341,19 +374,38 @@ class OZToResid:
         return attn_out    
 
 
-
 class Analyzer:
     def __init__(self, dataset, net, plot_dir=None):
+        """
+        Initialize the Analyzer class for analyzing model behavior.
+
+        Args:
+            dataset (dict): Dictionary containing:
+                - dataloader: DataLoader object for the dataset
+                - langs: Language information
+                - null_dataset_path: Path to null dataset for ablation studies
+            net: Neural network model to analyze
+            plot_dir (Path, optional): Directory to save analysis plots
+        """
         self.dataloader = dataset['dataloader']
-        self.net = net
-        self.plot_dir = plot_dir
-        self.langs = dataset['langs']
-        self.null_dataset_path = dataset['null_dataset_path']
-        self.cache = None
-        self.output = None
+        self.net = net  # Neural network model
+        self.plot_dir = plot_dir  # Directory for saving plots
+        self.langs = dataset['langs']  # Language information
+        self.null_dataset_path = dataset['null_dataset_path']  # Path to null dataset
+        self.cache = None  # Cache for storing activations
+        self.output = None  # Model outputs
 
 
     def build_graph(self, bias=False, prune_names=None):
+        """
+        Build the computation graph for the model.
+        Basically, for each node, connect it with it's direct upstream nodes.
+        Allowing a backpropagation from the output to the input.
+
+        Args:
+            bias (bool, optional): Whether to use bias in the linear layers
+            prune_names (dict, optional): Names of nodes to prune   
+        """
         all_hook_names = MLC_utils.get_module_names_by_regex(self.net, [{'module':'*hook*', 'head':'*'}])
         val_batch = next(iter(self.dataloader))
         cache, hooked_modules = hook_functions.add_hooks(self.net, mode='cache', hook_names=all_hook_names)
@@ -430,7 +482,7 @@ class Analyzer:
 
                 graph['enc', layer, 'self', head] = AttentionNode(module_name=f'enc.self.{layer}', head=head,
                                                                             q_stream=q_stream, k_stream=k_stream, v_stream=v_stream, attention_score=attention_score,
-                                                                            output_to_resid=attn_out_self[:,head,:,:], analysis=self)
+                                                                            output_to_resid=attn_out_self[:,head,:,:], analyzer=self)
 
         # on the decoder side
         for layer in range(nlayers_decoder):
@@ -494,7 +546,7 @@ class Analyzer:
 
                 graph['dec', layer, 'self', head] = AttentionNode(module_name=f'dec.self.{layer}', head=head,
                                                                             q_stream=q_stream, k_stream=k_stream, v_stream=v_stream, attention_score=attention_score,
-                                                                            output_to_resid=attn_out_self[:,head,:,:], analysis=self)
+                                                                            output_to_resid=attn_out_self[:,head,:,:], analyzer=self)
 
             # handle the cross attention
             for head in range(n_head):
@@ -525,7 +577,7 @@ class Analyzer:
 
                 graph['dec', layer, 'cross', head] = AttentionNode(module_name=f'dec.cross.{layer}', head=head,
                                                                             q_stream=q_stream, k_stream=k_stream, v_stream=v_stream, attention_score=attention_score,
-                                                                            output_to_resid=attn_out_cross[:,head,:,:], analysis=self)
+                                                                            output_to_resid=attn_out_cross[:,head,:,:], analyzer=self)
         
         # unembedding at last
         source_nodes = [graph['decoder_token'], graph['decoder_pos']]
@@ -538,15 +590,32 @@ class Analyzer:
         cache_output = MLC_utils.get_activations_by_regex(self.net, cache, [{'module':'*decoder_hook*','head':'*'}])[0]
         stream_to_unembedding = ActivationStream(source_nodes=source_nodes, in_pipeline=[cached_ln_decoder], cached_activation=cache_output)
         unembedding_proj = self.net.out.weight.detach().cpu().numpy()
-        graph['unembedding'] = UmembeddingNode(module_name='unembedding', input_stream=stream_to_unembedding, unembedding_proj=unembedding_proj, analysis=self)
+        graph['unembedding'] = UmembeddingNode(module_name='unembedding', input_stream=stream_to_unembedding, unembedding_proj=unembedding_proj, analyzer=self)
 
         self.graph = graph
 
 
-    def back_track(self, pred_arg, prune_names=None, plot_score=1, metric='VAF', sequential=1, n_track=1, threshold=0.8, rewrite=False):
-        back_track_plot_dir = self.plot_dir / f'BT_{metric}_token_{pred_arg}_plot'
-        back_track_data_dir = self.plot_dir / f'BT_{metric}_token_{pred_arg}_data'
+    def back_track(self, arg_output, plot_score=1, metric='loss', chained=1, n_track=1, threshold=0.8, 
+                   keep_one_only=1, render_circuit=False,rewrite=False):
+        '''
+        Backtrack through the model graph to find important nodes that influence the output.
 
+        Args:
+            arg_output: Output token index to consider
+            plot_score: Whether to plot score heatmaps (1) or not (0)
+            metric: Metric to use for scoring nodes ('VAF', 'MI', 'inner', 'loss', 'logit', 'customized')
+            chained: Whether to do chained path patching (1) or not (0)
+            n_track: Number of top scoring nodes to track backwards from
+            threshold: Minimum score threshold for considering a node important
+            keep_one_only: Whether to keep-one-only (1) or ablate-one-only (0) when doing ablation
+            rewrite: Whether to rewrite existing analysis files (True) or use cached results (False)
+        '''
+
+        # Create directories for saving plots and data
+        back_track_plot_dir = self.plot_dir / f'BT_{metric}_token_{arg_output}_plot'
+        back_track_data_dir = self.plot_dir / f'BT_{metric}_token_{arg_output}_data'
+
+        # Clear existing directories if rewriting
         if back_track_plot_dir.exists() and plot_score and rewrite:
             shutil.rmtree(back_track_plot_dir)
             shutil.rmtree(back_track_data_dir)
@@ -554,59 +623,47 @@ class Analyzer:
         back_track_plot_dir.mkdir(parents=True, exist_ok=True)
         back_track_data_dir.mkdir(parents=True, exist_ok=True)
 
-        problem_mode = 'qkv'
 
-        
+        # Get batch size from model output
         n_batch = len(self.output['yq_predict'])
-        seq_q = self.graph['unembedding'].input_stream.cached_activation.shape[1]
-        n_vocal = self.net.out.weight.shape[0]
 
-        pred_tokens = []
-        pred_tokens_id = []
-        pred_arg = np.array(pred_arg)
-        for b in range(n_batch):
-            output = np.array(self.output['yq_predict'][b])
-            pred_token = output[pred_arg+1]
-            pred_token_id = [self.langs['output'].symbol2index[t] for t in pred_token]
-            pred_tokens.append(pred_token)
-            pred_tokens_id.append(pred_token_id)
-        pred_tokens_id = np.vstack(pred_tokens_id)
+        # Convert output token indices to batch format
+        arg_output = np.array(arg_output)
+        arg_output_batch = np.vstack([arg_output.tolist() for b in range(n_batch)])
 
-        # first_token_ids = [self.langs['output'].symbol2index[t] for t in pred_tokens]
-        token_seq = np.vstack([pred_arg.tolist() for b in range(n_batch)])
-
-
+        # Initialize directed graph for visualization
         circuit = DirectedGraph(comment='MLC-Transformer', engine='neato') 
         
-        output_mask = np.zeros((n_batch, seq_q, n_vocal))
-        for b in range(n_batch):
-            output_mask[b, token_seq[b], pred_tokens_id[b]] = 1
-        
-        problem_stack = [self.graph['unembedding'].get_problems(weight_mask=output_mask, arg_q=token_seq, target_labels=pred_tokens_id)[0]]
+        # Start with unembedding node problem
+        problem_stack = [self.graph['unembedding'].get_problems(arg_output=arg_output_batch)[0]]
 
-        
+        # Track edges and sorting order
         sort_id = 0
         edges = []
+
+        # Main backtracking loop
         while problem_stack:
+            # Get next problem to analyze
             current_problem = problem_stack.pop(0)
             current_node = current_problem.current_node
             current_problem_str = f'{current_node.module_name}.{current_node.head} {current_problem.mode}'
             source_nodes = current_problem.source_stream.source_nodes
 
-            # check if can load backtracking score from saved data
+            # Load cached results if available and not rewriting
             if (back_track_data_dir/current_problem_str).exists() and not rewrite:
                 source_scores, arg_q, target_args = torch.load(back_track_data_dir/current_problem_str)
                 print(f'Loaded {current_problem_str}')
             else:
+                # Calculate scores for source nodes
                 source_scores, arg_q, target_labels, target_args = \
-                    current_problem.back_track(prune_names=prune_names, metric=metric,
-                                               sequential=sequential)
+                    current_problem.back_track(metric=metric, chained=chained, keep_one_only=keep_one_only)
                 torch.save([source_scores, arg_q, target_args], back_track_data_dir/current_problem_str)
 
+            # Get top scoring nodes
             arg_top_nodes = get_top_nodes(source_nodes, source_scores, n_track, threshold)
+            arg_top_nodes = arg_top_nodes[:n_track]
 
-
-            # ploting the score heatmap
+            # Plot score heatmap if requested
             if plot_score:
                 self.plot_node_scores(target_problem = current_problem, 
                     source_nodes = source_nodes, 
@@ -614,19 +671,22 @@ class Analyzer:
                     plot_dir=back_track_plot_dir, sort_id=sort_id,
                     cmap='cool',mid_0=False, balance=False)
             
-            # only do QKV problem
+            # Get next nodes to analyze based on top scores
             next_nodes = [source_nodes[i] for i in arg_top_nodes]
             next_scores = [source_scores[i] for i in arg_top_nodes]
+
+            # Process each next node
             for node, score in zip(next_nodes, next_scores):
-                problems = node.get_problems(arg_q=arg_q, mode=problem_mode, prev_problem=current_problem, 
+                # Get problems for this node
+                problems = node.get_problems(arg_q=arg_q, mode='qkv', prev_problem=current_problem, 
                                              target_labels=target_labels, target_args=target_args)
 
-                # for problem in problems:
+                # Check if edge already exists
                 edge_name = f'{node.module_name}{node.head}->{current_node.module_name}{current_node.head}: {current_problem.mode}'
                 if edge_name in edges:
-                    # print(edge_name)
                     continue
 
+                # Add problems to stack and update graph
                 problem_stack+=problems
                 print(f'({sort_id}){current_problem.current_node.module_name} {current_problem.current_node.head}\
                         {current_problem.mode} track back {node.module_name} {node.head}')
@@ -634,10 +694,10 @@ class Analyzer:
                 edges.append(edge_name)
                 sort_id+=1
 
-        filename = f'MLC-Transformer{pred_arg}'
-        save_path = self.plot_dir / f'{filename}.png'
-        # if (not save_path.exists()) or rewrite:
-        circuit.render(filename=filename, directory=self.plot_dir, view=True)
+        # Render final circuit visualization if requested
+        filename = f'MLC-Transformer{arg_output}'
+        if render_circuit:
+            circuit.render(filename=filename, directory=self.plot_dir, view=True)
 
         return circuit
 
@@ -722,135 +782,59 @@ class Analyzer:
   
         # analysis.decoder_to_umembedding(sender_names=[{'module':'*decoder*z_hook*','head':'*'}], rewrite=1)
 
+  
 
-    def run_minimal_circuit(self, circuit, rewrite=1):
-        all_nodes = circuit.all_nodes
-        used_nodes = circuit.used_nodes
-        unused_nodes = np.setdiff1d(all_nodes, used_nodes)
+    def run_path_patching(self, circuit: dict={}, chained=True, metric=None, eval_func=None, keep_one_only=0, rewrite=0):
+        """
+        Different from the run_path_patching in model_perturbation.py,
+        here we have metric function
+        goal is to find out which nodes are important for the receiver's metric
 
-        null_activations = torch.load(self.null_dataset_path)
+        circuit: specify the sender, receiver, and the problems
+        chained: the perturbation goes through a chain
+        metric: predefined metric 'loss', 'logit', or 'customized'
+        eval_func: if metric is 'customized', eval_func is the function to evaluate the metric
+        keep_one_only: 1 for keep-one-only, 0 for ablate-one-only, can be an int or a list for each problem in the list 
+        rewrite: whether to rewrite the circuit
+        """
 
-        ablate_names = []
-        for name in unused_nodes:
-            parts = name.split('.')
-            block = parts[0]
-            attn = parts[1]
-            layer = parts[2]
-            head = parts[3]
-
-            if block=='dec' and attn=='cross':
-                attn='multi'
-
-            ablate_name = MLC_utils.get_module_names_by_regex(self.net, [{'module':f'*{block}*{layer}*{attn}*z_hook*','head':f'{head}'}])
-            ablate_names+=ablate_name
-        cache, hooked_modules = hook_functions.add_hooks(self.net, mode='patch', hook_names=ablate_names, 
-                                patch_activation=[null_activations[str(name)] for name in ablate_names])
-        
-        val_batch = next(iter(self.dataloader))
-        output = MLC_utils.eval_model(val_batch, self.net, self.langs)
-        [hook.remove_hooks() for hook in hooked_modules]
-
-        print(output['yq_predict'])
-        print(len(used_nodes))
-        return output
-
-        
-
-    def prune_circuit(self, seed=0, rewrite=1):
-        
-        prune_path = self.plot_dir / 'prune_names'
-        if prune_path.exists() and not rewrite:
-            return torch.load(prune_path)
-
-        null_activations = torch.load(self.null_dataset_path)
-
-        net_prune_names = []
-
-        # start from output
-        val_batch = next(iter(self.dataloader))
-
-        decoder_heads = MLC_utils.get_module_names_by_regex(self.net, [{'module':f'*decoder*z_hook*','head':'*'}])
-        # shuffle the heads
-        # np.random.seed(seed)
-        decoder_heads = decoder_heads[::-1]
-
-
-        for name in decoder_heads:
-            _, hooked_modules = hook_functions.add_hooks(self.net, mode='patch', hook_names=net_prune_names+[name], 
-                                    patch_activation=[null_activations[str(name)] for name in net_prune_names+[name]])
-            output = MLC_utils.eval_model(val_batch, self.net, self.langs)
-            [hook.remove_hooks() for hook in hooked_modules]
-
-            if output['v_acc'].mean() == 1:
-                net_prune_names+=[name]
-
-        encoder_heads = MLC_utils.get_module_names_by_regex(self.net, [{'module':f'*encoder*z_hook*','head':'*'}])
-        # encoder_heads = encoder_heads[::-1]
-        for name in encoder_heads:
-            _, hooked_modules = hook_functions.add_hooks(self.net, mode='patch', hook_names=net_prune_names+[name], 
-                                    patch_activation=[null_activations[str(name)] for name in net_prune_names+[name]])
-            output = MLC_utils.eval_model(val_batch, self.net, self.langs)
-            [hook.remove_hooks() for hook in hooked_modules]
-
-            if output['v_acc'].mean() == 1:
-                net_prune_names+=[name]
-
-        # convert net names to circuit names
-        circuit_prune_names = []
-        for name in net_prune_names:
-            layer = name['module'].split('.')[3]
-            head = name['head']
-            if 'self_attn' in name['module']:
-                attn = 'self'
-            elif 'multihead_attn' in name['module']:
-                attn = 'cross'
-
-            if 'encoder' in name['module']:
-                block = 'enc'
-            elif 'decoder' in name['module']:
-                block = 'dec'
-
-            circuit_prune_names.append((f'{block}.{attn}.{layer}.{head}'))
-
-        prune_names = {
-            'circuit_name': circuit_prune_names,
-            'net_name': net_prune_names
-        }
-
-        print(len(net_prune_names))
-        torch.save(prune_names, prune_path)
-
-        return prune_names
-
-
-
-    def run_path_patching(self, circuit: dict={}, sequential=True, metric=None, eval_func=None, ablate_all=0, rewrite=0):
-        
-
-        # assert mode in ['out', 'z','q','k','v'], 'mode must be z, q, k or v'
         assert metric in ['loss', 'logit', 'customized']
 
+        # Load null activations and model
         null_activations = torch.load(self.null_dataset_path)
         net = self.net
         langs = self.langs
-        # perma_ablate_names = get_module_names_by_regex(net, 
-        #                                                [{'module':'*encoder*layer*0*z_hook*','head':'3'},
-        #                                                 {'module':'*encoder*layer*0*z_hook*','head':'4'}
-        #                                                 ])
 
 
+        """
+        A path contains a sender and a receiver.
+        The sender is the node you want to perturb, and the receiver is the node you want to test the effect of perturbation.
+        mode refers to whether the hook is 'qkv' or 'z'
 
+        In the 'chained' mode, the perturbation propagates from sender to each receiver sequentially.
+
+        For 'ablate-one-only':
+        1. patch the sender node with null activations
+        2. freeze all other nodes except the sender and receiver
+        3. run the model and cache the activations of the receiver
+
+        For 'keep-one-only':
+        1. Don't patch the first sender node in the chain
+        2. Knockout all source nodes to the receiver other than the sender
+        3. Run the model and cache the activations of the receiver
+        """
+
+        # Extract nodes and modes from circuit dict
         sender_nodes = copy.deepcopy(circuit['sender_nodes']) # a list of nodes
         sender_modes = copy.deepcopy(circuit['sender_modes']) # a list of modes
         receiver_nodes = copy.deepcopy(circuit['receiver_nodes']) # a list of nodes
         receiver_modes = copy.deepcopy(circuit['receiver_modes']) # a list of modes
         problems_chain = copy.deepcopy(circuit['problems_chain'])
-        # freeze_nodes = copy.deepcopy(circuit.get('knockouts', []))
         knockout_nodes = copy.deepcopy(circuit.get('knockout_nodes', []))
         knockout_modes = copy.deepcopy(circuit.get('knockout_modes', []))
-        ablate_all_list = copy.deepcopy(ablate_all)
+        keep_one_only_list = copy.deepcopy(keep_one_only)
 
-
+        # Convert circuit nodes to model hook names
         sender_names = []
         for i in range(len(sender_nodes)):
             sender_names += self.circuit_name_to_net_name(sender_nodes[i], suffix=f'*{sender_modes[i]}_hook*')
@@ -858,8 +842,7 @@ class Analyzer:
         receiver_names_chain = []
         for i in range(len(receiver_nodes)):
             if receiver_modes[i]=='out':
-                continue
-
+                receiver_names_chain+=['out']
             elif receiver_modes[i] in ['q','k','v']:
                 receiver_names_chain+=self.circuit_name_to_net_name(receiver_nodes[i], suffix=f'*{receiver_modes[i]}_hook*')
 
@@ -867,61 +850,55 @@ class Analyzer:
         for i in range(len(knockout_nodes)):
             knockout_names += self.circuit_name_to_net_name(knockout_nodes[i], suffix=f'*{knockout_modes[i]}_hook*')
 
+        # Get names of hooks to freeze
         freeze_names = MLC_utils.get_module_names_by_regex(self.net, [
             {'module':'*q_hook*', 'head':'*'},
             {'module':'*k_hook*', 'head':'*'},
             {'module':'*v_hook*', 'head':'*'}
             ])
         
-
-        """
-        both encoder and decoder share the same pos encoding
-        when ablating one side, keep the other side intact
-        """
+        # Handle position encoding hooks
         if any(['encoder_pos' in node.module_name for node in sender_nodes]):
             freeze_names+=MLC_utils.get_module_names_by_regex(net, [{'module':'*decoder*0*resid_pre_hook*', 'head':'*'}])
         if any(['decoder_pos' in node.module_name for node in sender_nodes]):
             freeze_names+=MLC_utils.get_module_names_by_regex(net, [{'module':'*encoder*0*resid_pre_hook*', 'head':'*'}])
         
+        # Optionally freeze MLP layers
         do_freeze_mlp = 0
         if do_freeze_mlp:
             freeze_names += MLC_utils.get_module_names_by_regex(net, [{'module':'*mlp*hook*','head':'*'}])
 
-
-        # clean input
+        # Get clean run metrics
         val_batch = next(iter(self.dataloader))
-
-        #------first run------
-        # forward clean run
         all_hook_names = MLC_utils.get_module_names_by_regex(self.net, [{'module':'*hook*', 'head':'*'}])
         cache_clean, hooked_cache_modules = hook_functions.add_hooks(net, mode='cache', hook_names=all_hook_names)
         output_clean = MLC_utils.eval_model(val_batch, net, langs)
         [hooked_module.remove_hooks() for hooked_module in hooked_cache_modules]
 
+        # Get clean metric based on specified type
         if metric=='loss':
             metric_clean = output_clean['loss']
         elif metric=='logit':
-            metric_clean = output_clean['logits_correct']  
+            metric_clean = output_clean['logits_correct']
         elif metric=='customized':
             metric_clean = eval_func(analyzer=self, cache_patch=cache_clean, output_patch=output_clean)
 
-
-
-        # get corrupted activation at the sender    
-
+        # Initialize patching variables
         cache_patch = null_activations
         first_sender = 1
-        if not isinstance(ablate_all_list, list):
-            ablate_all_list = [ablate_all_list]*len(receiver_names_chain)
+        if not isinstance(keep_one_only_list, list):
+            keep_one_only_list = [keep_one_only_list]*len(receiver_names_chain)
 
-        if sequential:
-            for i in range(len(receiver_names_chain)+1):
+        if chained:
+            # Run chained patching through receivers
+            for i in range(len(receiver_names_chain)):
                 receiver_names = [receiver_names_chain[i]] if i<len(receiver_names_chain) else []
 
                 print(f'receivers_chain: {receiver_names}, sender: {sender_names}')
                 corrupt_sender_activation = [cache_patch[str(name)] for name in sender_names]
-                if first_sender and ablate_all_list[i] :
-                    # if the first sender, don't patch the sender activity
+
+                # Handle first sender in keep-one-only mode
+                if first_sender and keep_one_only_list[i]:
                     first_sender = 0
                     sender_modules = [] 
                 else:
@@ -929,25 +906,21 @@ class Analyzer:
                     _, sender_modules = hook_functions.add_hooks(net, mode='patch', hook_names=sender_names, 
                                                                 patch_activation=corrupt_sender_activation)
 
-                # patch clean activations to the freeze hooks
-                # need to remove senders and receiver from frozen hooks
+                # Patch frozen hooks
                 freeze_names_exclusive = [name for name in freeze_names if name not in sender_names+receiver_names+knockout_names]
-                clean_freeze_activation = [cache_clean.cache[str(name)] for name in freeze_names_exclusive]
+                freeze_activations_exclusive = [cache_clean.cache[str(name)] for name in freeze_names_exclusive]
                 _, freeze_modules = hook_functions.add_hooks(net, mode='patch', hook_names=freeze_names_exclusive,
-                                                            patch_activation=clean_freeze_activation)
+                                                            patch_activation=freeze_activations_exclusive)
                 
-                # knockout patch
+                # Handle knockouts for keep-one-only mode
                 knockout_names = []
-                
                 problem = problems_chain[i] if i<len(problems_chain) else False
 
-                if problem and ablate_all_list[i]:
-                    # knockout all the source nodes other than sender
-                    
+                if problem and keep_one_only_list[i]:
                     source_nodes = problem.source_stream.source_nodes
                     
                     for source_node in (source_nodes):
-                        
+                        # Check if source node is in sender nodes
                         node_in_sender = 0
                         for sender_node in sender_nodes:
                             module_equal = source_node.module_name==sender_node.module_name
@@ -960,11 +933,11 @@ class Analyzer:
                             knockout_name = self.circuit_name_to_net_name(source_node, suffix=f'*z_hook*')
                             knockout_names+=knockout_name
 
-
+                # Apply knockouts
                 _, knockout_modules = hook_functions.add_hooks(net, mode='patch', hook_names=knockout_names, 
                                             patch_activation=[null_activations[str(name)] for name in knockout_names])
                 
-                # cache the receiver activations
+                # Run model with patches and get metrics
                 cache_patch, receiver_modules = hook_functions.add_hooks(net, mode='cache', hook_names=all_hook_names)
                 output_patch = MLC_utils.eval_model(val_batch, net, langs)
                 [hooked_module.remove_hooks() for hooked_module in sender_modules+freeze_modules+knockout_modules+receiver_modules]
@@ -976,38 +949,34 @@ class Analyzer:
                 elif metric=='customized':
                     metric_patch = eval_func(analyzer=self, cache_patch=cache_patch, output_patch=output_patch)
 
-
-
+                # Update for next iteration
                 sender_nodes = [receiver_nodes[i]] if i<len(receiver_nodes) else []
                 sender_names = [receiver_names_chain[i]] if i<len(receiver_names_chain) else []
                 cache_patch = cache_patch.cache
             
         else:
-            #------second run------
-
+            # Run single step patching
             loss_diff = []
             pred_tokens_patch = []
 
+            # Patch sender
             corrupt_sender_activation = [null_activations[str(name)] for name in sender_names]
             _, sender_modules = hook_functions.add_hooks(net, mode='patch', hook_names=sender_names, 
                                                         patch_activation=corrupt_sender_activation)
 
-            # patch clean activations to the freeze hooks
-            # need to remove senders and receiver from frozen hooks
+            # Patch frozen hooks
             freeze_names_exclusive = [name for name in freeze_names if name not in sender_names+receiver_names_chain+knockout_names]
-            clean_freeze_activation = [cache_clean.cache[str(name)] for name in freeze_names_exclusive]
+            freeze_activations_exclusive = [cache_clean.cache[str(name)] for name in freeze_names_exclusive]
             _, freeze_modules = hook_functions.add_hooks(net, mode='patch', hook_names=freeze_names_exclusive,
-                                                        patch_activation=clean_freeze_activation)
+                                                        patch_activation=freeze_activations_exclusive)
             
-            # knockout patch
+            # Apply knockouts
             _, knockout_modules = hook_functions.add_hooks(net, mode='patch', hook_names=knockout_names, 
                                         patch_activation=[null_activations[str(name)] for name in knockout_names])
             
-            # cache the receiver activations
+            # Run model with patches and get metrics
             cache_patch, receiver_modules = hook_functions.add_hooks(net, mode='cache', hook_names=all_hook_names)
-
             output_patch = MLC_utils.eval_model(val_batch, net, langs)
-
             [hooked_module.remove_hooks() for hooked_module in sender_modules+freeze_modules+knockout_modules+receiver_modules]
 
             if metric=='loss':
@@ -1016,8 +985,6 @@ class Analyzer:
                 metric_patch = output_patch['logits_correct']
             elif metric=='customized':
                 metric_patch = eval_func(model=self, cache_patch=cache_patch, output_patch=output_patch)
-            # if no receiver, the second run is the last run
-            # no third run
 
         return metric_clean, metric_patch
 
@@ -1028,17 +995,16 @@ class Analyzer:
     def compute_VAF(self, problem):
         
         target_activation = problem.source_stream.cached_activation
-        source_nodes, source_activations = problem.source_stream.forward()
+        _, source_activations = problem.source_stream.forward()
 
-        arg_q = problem.arg_q
-        n_batch = target_activation.shape[0]
+        arg_output = problem.arg_output
         
         is_encoder = 'enc' in problem.current_node.module_name
         is_kv = problem.mode in ['k','v']
         if (not is_encoder) and (not is_kv):
 
-            target_activation = np.take_along_axis(target_activation.squeeze(), arg_q[:,:,None], axis=1)
-            source_activations = [np.take_along_axis(source_activation.squeeze(), arg_q[:,:,None], axis=1) 
+            target_activation = np.take_along_axis(target_activation.squeeze(), arg_output[:,:,None], axis=1)
+            source_activations = [np.take_along_axis(source_activation.squeeze(), arg_output[:,:,None], axis=1) 
                                   for source_activation in source_activations]
 
         if target_activation.ndim>2:
@@ -1066,20 +1032,10 @@ class Analyzer:
             return contribution
 
 
-
-
-
-        # Fit linear regression model
         vaf_scores = []
         Y = target_activation
         for source_activation in source_activations:
             X = source_activation
-
-            if False:
-                model = LinearRegression()
-                model.fit(X, Y)
-                Y_pred = model.predict(X)
-                variance_explained = r2_score(Y, Y_pred)
             
             if 1:
                 variance_explained = variance_contribution(X, Y)
@@ -1092,13 +1048,11 @@ class Analyzer:
     def compute_MI(self, problem):
 
         target_activations = problem.source_stream.cached_activation
-        target_labels = np.array(problem.target_labels)
         vector_ids = problem.target_args['vector_ids']
         vector_labels = problem.target_args['vector_labels']
-        source_nodes, source_activations = problem.source_stream.forward()
+        _, source_activations = problem.source_stream.forward()
         
 
-        arg_q = problem.arg_q
         n_batch = target_activations.shape[0]
         mi_scores = []
         for source_activation in source_activations:
@@ -1799,101 +1753,78 @@ class Analyzer:
         plt.show()
 
 
-    def backtrack_dec_cross_1_5(self, block, layer, type, head, rewrite=0):
+    def backtrack_dec_cross_1_5_qk(self, mode='k', rewrite=0):
+        """
+        Performs backtracking analysis on decoder cross attention layer 1 head 5.
+        Traces information flow through Q/K/V streams to understand attention patterns.
+
+        Args:
+            mode: Which attention stream to analyze ('q', 'k')
+            rewrite: Whether to recompute and overwrite existing saved results
+        """
+        # Set up directories for saving results
         save_dir = self.plot_dir/'dec_cross_1_5'
         save_dir.mkdir(exist_ok=True, parents=True)
-        backtrack_plot_dir = save_dir / 'BT_k_plot'
-        backtrack_data_dir = save_dir / 'BT_k_data'
+        backtrack_plot_dir = save_dir / 'backtrack_plot'
+        backtrack_data_dir = save_dir / 'backtrack_data'
 
+        # Clear existing results if rewriting
         if backtrack_plot_dir.exists() and rewrite:
             shutil.rmtree(backtrack_plot_dir)
             shutil.rmtree(backtrack_data_dir)
 
         backtrack_plot_dir.mkdir(exist_ok=True, parents=True)
         backtrack_data_dir.mkdir(exist_ok=True, parents=True)
-        output = self.output
-        n_batch = len(output['yq_predict'])
+
+        # Get the attention node we want to analyze
+        block = 'dec'
+        layer = 1
+        type = 'cross' 
+        head = 5
         node = self.graph[block, layer, type, head]
-        attention = node.attention_score
-        arg_pred = np.arange(3)
-        arg_max_k = attention[np.arange(n_batch),0,:len(arg_pred),:].argmax(-1)
 
+        # Initialize problem stack with specified attention stream
+        problem_stack = node.get_problems(mode=mode)
+        # problem_stack += node.get_problems(mode='q')
 
-        q_labels=[]
-        k_labels=[]
-        q_ids=[]
-        k_ids=[]
-        # get the q, k seq_label
-        for b in range(n_batch):
-            xq_context = np.array(output['xq_context'][b])
-            yq = output['yq'][b]
-            arg_max_kb = arg_max_k[b]
-            arg_max_kb[arg_max_kb>=len(xq_context)]=0
-            pred_tokens_enc = xq_context[arg_max_kb]
-            pos_1st_sos = np.where(xq_context=='SOS')[0][0]
-            query_tokens = xq_context[:pos_1st_sos]
-            grammar_str = output['grammar'][b]['aux']['grammar_str']
-            grammar_dict = MLC_utils.grammar_to_dict(grammar_str)
-            acc_b = []
-            q_id = []
-            k_id = []
-            q_label = []
-            k_label = []
-            for i in arg_pred:
-                token = pred_tokens_enc[i]
-                if i>=len(yq):
-                    acc_b.append(np.nan)
-                    # inner.append(np.nan)
-                    # inner_null.append(np.nan)
-                    continue
-                if token==yq[i]:
-                    acc_b.append(1)
-                    color_symbol = grammar_dict[1][token]
-                    symbol_pos = [i for i, token in enumerate(query_tokens) if token==color_symbol][0]
-                    q_id.append(i)
-                    k_id.append(arg_max_kb[i])
-                    q_label.append(symbol_pos)
-                    k_label.append(symbol_pos)
-
-                else:
-                    acc_b.append(0)
-            q_ids.append(q_id)
-            k_ids.append(k_id)
-            q_labels.append(q_label)
-            k_labels.append(k_label)
-
-        circuit = DirectedGraph(comment='MLC-Transformer', engine='neato') 
-        q_args = {'vector_ids':q_ids, 'vector_labels':q_labels}
-        k_args = {'vector_ids':k_ids, 'vector_labels':k_labels}
-        problem_stack = node.get_problems(mode='k', target_args=k_args)
-
-        problem_stack += node.get_problems(mode='q', target_args=q_args)
-
-
+        # Track edges we've seen to avoid duplicates
         sort_id = 0
         edges = []
+
+        # Process each problem in the stack
         while problem_stack:
             current_problem = problem_stack.pop(0)
             current_node = current_problem.current_node
             current_problem_str = f'{current_node.module_name}.{current_node.head} {current_problem.mode}'
             source_nodes = current_problem.source_stream.source_nodes
 
-
-            # check if can load backtracking score from saved data
+            # Load cached results if they exist and we're not rewriting
             if (backtrack_data_dir/current_problem_str).exists() and not rewrite:
                 source_scores, arg_q, target_labels, target_args = torch.load(backtrack_data_dir/current_problem_str)
                 print(f'Loaded {current_problem_str}')
             else:
-                source_scores, arg_q, target_labels, target_args = \
-                current_problem.back_track(metric='customized', eval_func=eval_dec_cross_1_5_attn, ablate_all=True)
+                # Special handling for dec.cross.0.6 v node
+                # this head needs to combine both ablation strategies
+                if current_problem_str == 'dec.cross.0.6 v':
+                    keep_one_only = [False,True]
+                    prev_score = next_scores[0]
+                else:
+                    keep_one_only = True
 
+                # Compute backtracking scores
+                source_scores, arg_q, target_labels, target_args = \
+                current_problem.back_track(metric='customized', eval_func=eval_dec_cross_1_5_attn, keep_one_only=keep_one_only)
+
+                # special handling for dec.cross.0.6 v node
+                if current_problem_str == 'dec.cross.0.6 v':
+                    source_scores = prev_score-source_scores
+
+                # Cache the results
                 torch.save([source_scores, arg_q, target_labels, target_args], backtrack_data_dir/current_problem_str)
 
-
+            # Get top scoring source nodes
             arg_top_nodes = get_top_nodes(source_nodes, source_scores, n_track=1, threshold=0.5)
-
-
-            # ploting the score heatmap
+            # Plot score heatmap
             if True:
                 self.plot_node_scores(target_problem = current_problem, 
                     source_nodes = source_nodes, 
@@ -1901,23 +1832,24 @@ class Analyzer:
                     plot_dir=backtrack_plot_dir, sort_id=sort_id,
                     cmap='cool', mid_0=False, include_emb=True, balance=False)
             
-            # only do QKV problem
+            # Process next set of nodes to analyze
             next_nodes = [source_nodes[i] for i in arg_top_nodes]
             next_scores = [source_scores[i] for i in arg_top_nodes]
             for node, score in zip(next_nodes, next_scores):
+                # Generate new problems to analyze value stream
+                # only care about who contributes to the V of the current node
                 problems = node.get_problems(arg_q=arg_q, mode='v', prev_problem=current_problem, 
                                              target_labels=target_labels, target_args=target_args)
 
-                # for problem in problems:
+                # Skip if we've seen this edge before
                 edge_name = f'{node.module_name}{node.head}->{current_node.module_name}{current_node.head}: {current_problem.mode}'
                 if edge_name in edges:
-                    # print(edge_name)
                     continue
 
+                # Add new problems to stack and track edge
                 problem_stack+=problems
                 print(f'({sort_id}){current_problem.current_node.module_name} {current_problem.current_node.head}\
                         {current_problem.mode} track back {node.module_name} {node.head}')
-                circuit.add_edge(sender=node, receiver=current_problem, score=str(np.round(score,1)))
                 edges.append(edge_name)
                 sort_id+=1
 
@@ -2154,164 +2086,6 @@ class Analyzer:
 
         a=1
 
-    def analyze_dec_cross_0_3(self, block, layer, type, head):
-        output = self.output
-        n_batch = len(output['yq_predict'])
-
-        attention = self.graph[block, layer, type, head].attention_score
-        arg_max_k = attention[np.arange(n_batch),0,0,:].argmax(-1)
-        cached_v = self.graph[block, layer, type, head].v_stream.cached_activation
-        cached_q = self.graph[block, layer, type, head].q_stream.cached_activation
-        cached_k = self.graph[block, layer, type, head].k_stream.cached_activation
-        if ('dec' in block) and ('cross' in type):
-            type='multi'
-        cached_z = MLC_utils.get_activations_by_regex(net=self.net, 
-                                                    cache=self.cache,
-                                                    hook_regex=[{'module':f'*{block}*{layer}*{type}*z_hook*', 'head': f'{head}'}]
-                                                    )[0]
-        # cached_q = self.graph[block, layer, type, head].q_stream.cached_activation
-        # cached_k = self.graph[block, layer, type, head].k_stream.cached_activation[np.arange(n_batch),0,arg_max_k,:]
-
-        """
-        Hypothesis: 
-        the V symbols contain relative pos info to the nearest function
-        """
-
-        q = []
-        k = []
-        v = []
-        z = []
-        
-        k_null = []
-        k_null_label = []
-
-        q_label=[]    
-        k_label=[]
-        v_label = []
-        z_label = []
-
-        exclude = []
-
-        for b in range(n_batch):
-            xq_context = np.array(output['xq_context'][b])
-            yq = output['yq'][b]
-            v_acc = output['v_acc'][b]
-            if v_acc==0:
-                exclude.append(b)
-                continue
-            
-
-            
-            grammar_str = output['grammar'][b]['aux']['grammar_str']
-            grammar_dict = MLC_utils.grammar_to_dict(grammar_str)
-
-            # exclude trials with more than 1 query function
-            pos_1st_sos = np.where(xq_context=='SOS')[0][0]
-
-            # keep only trials with only one function in query
-            query_functions = [token for i, token in enumerate(xq_context[:pos_1st_sos]) if token in grammar_dict[2].keys()]
-            if len(query_functions)!=1:
-                exclude.append(b)
-                continue
-
-            query_func = query_functions[0]
-
-            # find 1st colors after function
-            func_poses_all = [i for i, token in enumerate(xq_context) if token==query_func]
-            func_poses_single = []
-            sos_poses = np.where(xq_context=='SOS')[0]
-
-            for pos_symbol in func_poses_all:
-                sos_before = sos_poses[sos_poses<pos_symbol]
-                if len(sos_before)==0:
-                    sos_before = 0
-                else:
-                    sos_before = sos_before[-1]
-                sos_after = sos_poses[sos_poses>pos_symbol][0]
-                n_func = 0
-                for s in xq_context[sos_before:sos_after]: # centered around the function
-                    if s in grammar_dict[2].keys():
-                        n_func+=1
-                if n_func==1:
-                    func_poses_single.append(pos_symbol)
-
-            # exclude trials with no single function demonstrations
-            if len(func_poses_single)<=1:
-                exclude.append(b)
-                continue
-            
-            """
-            Token: Union[Symbol, Function]
-            Symbol: token for color
-            """
-            # all query symbols 
-
-            z.append(cached_z[b,0,0,:])
-
-            query_tokens = xq_context[:pos_1st_sos]
-            # q.append(cached_q[b,0,0,:])
-            # k.append(cached_k[b,0,arg_max_k[b],:])
-
-
-            last_func_pos = np.array([i for i, token in enumerate(xq_context) if token==query_func])[-1]
-            all_io_pos = np.array([i for i, token in enumerate(xq_context) if token=='IO'])
-            io_pos = all_io_pos[all_io_pos>last_func_pos][0]
-
-            sos_before, sos_after = sos_around_pos(xq_context, last_func_pos)
-            correct_color = yq[0]
-            symbol = grammar_dict[1][correct_color]
-            symbol_pos = [i for i, token in enumerate(query_tokens) if token==symbol][0]
-            z_label.append(symbol_pos)
-            # k_label.append(symbol_pos)
-
-            # color symbols not in query
-            query_color_symbols = [token for token in query_tokens if token in grammar_dict[0].keys()]
-            query_colors = [grammar_dict[0][token] for token in query_color_symbols]
-
-            pos_non_query_color = np.array([i for i, token in enumerate(xq_context) if token not in query_colors])
-            k_null.append(cached_k[b,0,pos_non_query_color,:])
-            k_null_label+=[-1]*pos_non_query_color.shape[0]
-
-            # all_color_symbols = np.unique([token for token in xq_context if token in grammar_dict[0].keys()])
-            # color_symbols_not_in_query = np.setdiff1d(all_color_symbols, query_color_symbols)
-            # color_not_in_query = np.unique([grammar_dict[0][token] for token in color_symbols_not_in_query])
-            # for color in color_not_in_query:
-            #     all_color_pos = np.array([i for i, t in enumerate(xq_context) if t==color])
-            #     k_null.append(cached_k[b,0,all_color_pos,:])
-
-            #     k_null_label+=[-1]*all_color_pos.shape[0]
-
-
-        q = np.vstack(q) if len(q)>0 else q
-        k = np.vstack(k) if len(k)>0 else k
-
-        k_null = np.vstack(k_null) if len(k_null)>0 else k_null
-        z = np.vstack(z) if len(z)>0 else z
-
-        # v = np.vstack(v)
-        # z = np.vstack(z)
-        # v_label = np.array(v_label)
-        z_label = np.array(z_label)
-        k_label = np.array(k_label)
-        k_null_label = np.array(k_null_label)
-        # print(k_label.mean())
-        # Combine datasets for joint PCA
-
-        # only plot not excluded data
-        # q = q[~np.isin(np.arange(n_batch), exclude)]
-        # k = k[~np.isin(np.arange(n_batch), exclude)]
-        # v = v[~np.isin(np.arange(n_batch), exclude)]
-        fig, ax = plt.subplots(1,2,figsize=(8,6))
-        # plot_pca(ax=ax[0], data=[q,k,k_null], source_labels=['q','k', 'k_null'],color_labels=[k_label,k_label,k_null_label])
-
-        plot_2D(ax=ax[1], source_data=[z,k_null], source_legends=['z','k_null'],markers=['s','.'], color_labels=[z_label], color_dict_all={-1:'grey'})
-
-        # plot_pca(data=[q,k], source_labels=['q','k'],color_labels=[k_label, k_label])
-        plt.show()
-
-        a=1
-
-
 
 
     def circuit_name_to_net_name(self, node:str, suffix:str):
@@ -2343,23 +2117,41 @@ class Analyzer:
         return net_names
 
 def get_top_nodes(source_nodes, score, n_track, threshold):
-    # in the ranking, exclude embedding nodes
+    """
+    Get the top scoring nodes based on importance scores and thresholds.
+    Handles embedding and non-embedding nodes separately.
+
+    Args:
+        source_nodes: List of nodes to score
+        score: Array of importance scores for each node
+        n_track: Number of top non-embedding nodes to return
+        threshold: Score threshold for including embedding nodes
+
+    Returns:
+        Array of indices for the top scoring nodes
+    """
+    # Get module names for each node
     source_names = [node.module_name for node in source_nodes]
 
-    # source_scores = source_scores/np.linalg.norm(target_vectors,2)**2
+    # Get scores for each node
     source_scores = score
+
+    # Separate embedding nodes (position and token embeddings) from other nodes
     arg_embedding = [i for i, name in enumerate(source_names) if 'pos' in name or 'token' in name]
     arg_non_emb = np.setdiff1d(np.arange(len(source_names)), arg_embedding)
 
-    # select all nodes with score more than threshold
+    # Calculate score threshold as min + threshold * range
     threshold_score = source_scores.min() + (source_scores.max()-source_scores.min())*threshold
 
-
+    # Get top n_track non-embedding nodes by score
     arg_max_nonemb = arg_non_emb[np.argsort(source_scores[arg_non_emb])]
     arg_max_nonemb = arg_max_nonemb[-n_track:]
 
+    # Get embedding nodes that exceed threshold score
     arg_larger_than_threshold = np.where(source_scores>threshold_score)[0]
     arg_max_emb = np.intersect1d(arg_larger_than_threshold, arg_embedding)
+
+    # Combine top non-embedding and thresholded embedding nodes
     arg_max_nodes = np.concatenate([arg_max_nonemb, arg_max_emb])
     return arg_max_nodes
 
@@ -2511,51 +2303,64 @@ def get_top_tokens(xq_context, attention, percent):
 
     return pred_tokens
 
+
 def eval_dec_cross_1_5_attn(analyzer, cache_patch, output_patch):
+    """
+    Evaluates attention patterns in decoder cross attention layer 1 head 5.
+    
+    Args:
+        analyzer: The model analyzer object
+        cache_patch: Cache of model activations with patched values
+        output_patch: Model outputs with patched values
+        
+    Returns:
+        float: Mean attention score for correct color token predictions
+    """
     output_org = analyzer.output
     n_batch = len(output_org['yq_predict'])
-    arg_pred = np.arange(5)
+    arg_pred = np.arange(5)  # Look at first 5 predictions
     batch_ids = []
     attn_correct = []
-    # attn_2nd = []
 
-    """
-    pickup the trials where the original model worked
-    and evaluate attention diff between 1st and 2nd tokens on those trials
-    """
-
+    # Get attention weights for decoder layer 1 head 5
     attn_dec_1_5 = MLC_utils.get_activations_by_regex(net=analyzer.net,
                                                      cache=cache_patch,
                                                      hook_regex=[{'module':'*dec*1*multi*attn_weight*', 'head':'5'}])[0]
+    
     for b in range(n_batch):
+        # Get model inputs and outputs for this batch
         xq_context = np.array(output_org['xq_context'][b])
         grammar_str = output_org['grammar'][b]['aux']['grammar_str']
         grammar_dict = MLC_utils.grammar_to_dict(grammar_str)
         yq = np.array(output_org['yq'][b])
         yq_predict = np.array(output_org['yq_predict'][b])
 
+        # Check if model predictions were correct
         try:
             correct = np.all(yq[arg_pred]==yq_predict[arg_pred+1])
         except:
             correct = False
 
         if not correct:
-            # the intact model performed 
+            # Skip if model predictions were incorrect
             continue
 
         batch_ids.append(b)
-        color_poses = []
-        color_symbols = []
-        symbol_poses = []
+        color_poses = []  # Positions of color tokens
+        color_symbols = []  # Corresponding symbols for colors
+        symbol_poses = []  # Positions of symbols
+        
+        # For each color in the predictions
         for i,color in enumerate(yq[arg_pred]):
-
+            # Find positions of color tokens and their symbols
             color_poses.append([j for j, token in enumerate(xq_context) if token==color])
             color_symbols.append(grammar_dict[1][color])
             symbol_poses.append([j for j, token in enumerate(xq_context) if token==grammar_dict[1][color]])
 
-
+            # Get attention scores for correct color positions
             attn_correct.append(attn_dec_1_5[b,0,i,color_poses[-1]].sum(0))
 
+    # Return mean attention score
     attn_correct = np.array(attn_correct).mean()
 
     return attn_correct

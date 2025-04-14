@@ -301,6 +301,297 @@ class Analyzer:
 
 
 
+    def perturb_dec_cross_1_5_k_for_logit(self, block, layer, type, head):
+        if self.plot_dir != 'None':
+            save_dir = self.plot_dir/'dec_cross_1_5'
+            save_dir.mkdir(exist_ok=True, parents=True)
+            perturbation_plot_dir = save_dir / 'perturbation_plot'
+            perturbation_plot_dir.mkdir(exist_ok=True, parents=True)
+
+        attn_dec_1_5_name = MLC_utils.get_module_names_by_regex(self.net, [{'module':'*dec*1*multi*attn_weight*', 'head':'5'}])
+        attn_dec_1_5 = self.cache.cache[str(attn_dec_1_5_name[0])]
+        k_dec_1_5_name = MLC_utils.get_module_names_by_regex(self.net, [{'module':'*dec*1*multi*k_hook*', 'head':'5'}])
+
+        v_enc_1_1_name = MLC_utils.get_module_names_by_regex(self.net, [{'module':'*enc*1*self*v_hook*', 'head':'1'}])
+        v_enc_1_1 = self.cache.cache[str(v_enc_1_1_name[0])]
+        v_enc_1_1_swap = copy.deepcopy(v_enc_1_1)
+
+        v_enc_1_0_name = MLC_utils.get_module_names_by_regex(self.net, [{'module':'*enc*1*self*v_hook*', 'head':'0'}])[0]
+        v_enc_1_0 = self.cache.cache[str(v_enc_1_0_name)]
+        v_enc_1_0_swap = copy.deepcopy(v_enc_1_0)
+
+
+        v_enc_0_5_name = MLC_utils.get_module_names_by_regex(self.net, [{'module':'*enc*0*self*v_hook*', 'head':'5'}])
+
+
+        resid_pre_name = MLC_utils.get_module_names_by_regex(self.net, [{'module':'*enc*0*resid_pre_hook*', 'head':'*'}])
+        token_embedding = self.backtrack_analysis.graph['encoder_token'].output_to_resid
+        pos_embedding = self.backtrack_analysis.graph['encoder_pos'].output_to_resid
+        pos_embedding_swap = copy.deepcopy(pos_embedding)
+
+
+        # v_enc_
+        output = self.output
+        n_batch = len(output['yq_predict'])
+        arg_pred = np.arange(2)
+        # arg_max_k = attention[np.arange(n_batch),0,:len(arg_pred),:].argmax(-1)
+        acc_arg_pred = []
+        batch_ids = []
+        attn_1st = []
+        attn_2nd = []
+        logit_1st_org = []
+        logit_2nd_org = []
+        logit_rand_org = []
+        acc_org = []
+        for b in range(n_batch):
+            xq_context = np.array(output['xq_context'][b])
+            grammar_str = output['grammar'][b]['aux']['grammar_str']
+            grammar_dict = MLC_utils.grammar_to_dict(grammar_str)
+            yq = np.array(output['yq'][b])
+            yq_predict = np.array(output['yq_predict'][b])
+
+            logits_nvocab = output['logits_nvocab'][b]
+            correct = np.all(yq[arg_pred]==yq_predict[arg_pred+1])
+            acc_org.append(correct)
+            if (not correct) or (yq[0]==yq[1]):
+                continue
+
+            batch_ids.append(b)
+
+            first_color = yq[0]
+            idx_1st = self.langs['output'].symbol2index[first_color]
+            logit_1st_org.append(logits_nvocab[0, idx_1st])
+            first_color_poses = [i for i, token in enumerate(xq_context) if token==first_color]
+            first_color_symbol = grammar_dict[1][first_color]
+            first_symbol_poses = [i for i, token in enumerate(xq_context) if token==first_color_symbol]
+
+            second_color = yq[1]
+            idx_2nd = self.langs['output'].symbol2index[second_color]
+            logit_2nd_org.append(logits_nvocab[0, idx_2nd])
+            # mean of all other logits
+            logit_rand_org.append(logits_nvocab[0, np.setdiff1d(np.arange(self.langs['output'].n_symbols), [idx_1st, idx_2nd])].mean())
+            second_color_poses = [i for i, token in enumerate(xq_context) if token==second_color]
+            second_color_symbol = grammar_dict[1][second_color]
+            second_symbol_poses = [i for i, token in enumerate(xq_context) if token==second_color_symbol]
+
+
+
+            attn_1st.append([attn_dec_1_5[b,0,0,first_color_poses].sum(0),
+                             attn_dec_1_5[b,0,0,second_color_poses].sum(0)])
+            attn_2nd.append([attn_dec_1_5[b,0,1,second_color_poses].sum(0),
+                             attn_dec_1_5[b,0,1,first_color_poses].sum(0)])
+
+            # swap the v between those two symbols
+            v_enc_1_1_swap[b,0,first_symbol_poses,:] = v_enc_1_1[b,0,second_symbol_poses,:].mean(0)
+            v_enc_1_1_swap[b,0,second_symbol_poses,:] = v_enc_1_1[b,0,first_symbol_poses,:].mean(0)
+
+            v_enc_1_0_swap[b,0,first_color_poses,:] = v_enc_1_0[b,0,second_color_poses,:].mean(0)
+            v_enc_1_0_swap[b,0,second_color_poses,:] = v_enc_1_0[b,0,first_color_poses,:].mean(0)
+
+            # swap the positional embedding between two symbols
+            pos_embedding_swap[b, first_symbol_poses[0],:] = pos_embedding[b, second_symbol_poses[0],:]
+            pos_embedding_swap[b, second_symbol_poses[0],:] = pos_embedding[b, first_symbol_poses[0],:]
+        
+        # patch enc_1_1 v_hook and run again
+        acc_org = np.array(acc_org)
+        logit_1st_org = np.array(logit_1st_org)
+        logit_2nd_org = np.array(logit_2nd_org)
+        logit_rand_org = np.array(logit_rand_org)
+
+        attn_1st = np.array(attn_1st)
+        attn_2nd = np.array(attn_2nd)
+        print(attn_1st.mean(0))
+        print(attn_2nd.mean(0))
+        """
+        [0.95475894 0.02097722]
+        [0.9313862  0.00860984]
+        """
+
+        if 1:
+            # swapping pos_embedding, only affect z_dec_1_5
+            resid_pre_swap = pos_embedding_swap+token_embedding
+            circuit = {'sender_names':resid_pre_name, 
+                        'receiver_names':[
+                            MLC_utils.get_module_names_by_regex(self.net, [{'module':'*dec*1*multi*z_hook*', 'head':'0|2|4|5|6|7'}]),
+                            MLC_utils.get_module_names_by_regex(self.net, [{'module':'*output_embedding_hook*', 'head':'*'}])
+                        ],
+                        'freeze_names': ['None','All'],
+                        'knockout_names':   
+                            []  
+                        }
+            
+            swap_data = [resid_pre_swap]
+            _, output_swap = self.run_path_patching(circuit=circuit, patch_data=swap_data)
+            """
+            [0.09293616 0.581418  ]
+            [0.12315495 0.5718108 ]
+            """
+
+
+        if 1: 
+            # only keep enc_1_1 and enc_0_5 for clean run
+            circuit = {'sender_names':[
+                # v_enc_1_1_name
+                ], 
+                    'receiver_names':[v_enc_1_1_name, k_dec_1_5_name],
+                    'knockout_names':                  
+                        MLC_utils.get_module_names_by_regex(self.net, [{'module':'*enc*1*self*z_hook*', 'head':'0|2|3|4|5|6|7'}])+\
+                        MLC_utils.get_module_names_by_regex(self.net, [{'module':'*enc*0*self*z_hook*', 'head':'0|1|2|3|4|6|7'}])
+                        # MLC_utils.get_module_names_by_regex(self.net, [{'module':'*enc*0*resid_pre_hook*', 'head':'*'}])
+                    }
+            swap_data = [v_enc_1_1_swap]
+            cache_no_swap, _ = self.run_path_patching(circuit=circuit, patch_data=swap_data)
+
+            """
+            [0.6228579  0.10284919]
+            [0.69263864 0.09829289]
+            """
+
+
+
+
+        if 1:
+            # swapping pos_embedding for v_enc_0_45
+            resid_pre_swap = pos_embedding_swap+token_embedding
+            circuit = {'sender_names':resid_pre_name, 
+                        'receiver_names':[
+                                        MLC_utils.get_module_names_by_regex(self.net, [{'module':'*enc*0*self*v_hook*', 'head':'4|5'}]), 
+                                        v_enc_1_1_name, 
+                                        k_dec_1_5_name],
+                        'knockout_names':                  
+                            MLC_utils.get_module_names_by_regex(self.net, [{'module':'*enc*1*self*z_hook*', 'head':'0|2|3|4|5|6|7'}])+\
+                            MLC_utils.get_module_names_by_regex(self.net, [{'module':'*enc*0*self*z_hook*', 'head':'0|1|2|3|6|7'}])
+                            # analysis.get_module_names_by_regex(self.net, [{'module':'*enc*0*resid_pre_hook*', 'head':'*'}])
+                        }
+            
+            swap_data = [resid_pre_swap]
+            cache_swap, _ = self.run_path_patching(circuit=circuit, patch_data=swap_data)
+            """
+            [0.09293616 0.581418  ]
+            [0.12315495 0.5718108 ]
+            """
+        # only check the valid batch_ids
+        attn_swap = cache_swap.cache[str(attn_dec_1_5_name[0])]
+        attn_no_swap = cache_no_swap.cache[str(attn_dec_1_5_name[0])]
+        attn_1st_swap = []
+        attn_1st_no_swap = []
+        logit_1st_swap = []
+        logit_2nd_swap = []
+        logit_rand_swap = []
+        acc_swap = []
+        for b in batch_ids:
+            xq_context = np.array(output['xq_context'][b])
+            grammar_str = output['grammar'][b]['aux']['grammar_str']
+            grammar_dict = MLC_utils.grammar_to_dict(grammar_str)
+            yq = np.array(output['yq'][b])
+            yq_predict = np.array(output['yq_predict'][b])
+            correct = np.all(yq[arg_pred]==yq_predict[arg_pred+1])
+
+            logits_nvocab_swap = output_swap['logits_nvocab'][b]
+            yq_swap = np.array(output_swap['yq'][b])
+            yq_predict_swap = np.array(output_swap['yq_predict'][b])
+            correct_swap = np.all(yq_swap[arg_pred]==yq_predict_swap[arg_pred+1])
+            acc_swap.append(correct_swap)
+
+            if (not correct) or (yq[0]==yq[1]):
+                continue
+
+            # batch_ids.append(b)
+
+            first_color = yq[0]
+            idx_1st = self.langs['output'].symbol2index[first_color]
+            logit_1st_swap.append(logits_nvocab_swap[0, idx_1st])
+            first_color_poses = [i for i, token in enumerate(xq_context) if token==first_color]
+            
+            second_color = yq[1]
+            idx_2nd = self.langs['output'].symbol2index[second_color]
+            logit_2nd_swap.append(logits_nvocab_swap[0, idx_2nd])
+            logit_rand_swap.append(logits_nvocab_swap[0, np.setdiff1d(np.arange(self.langs['output'].n_symbols), 
+                                                                      [idx_1st, idx_2nd])].mean())
+            second_color_poses = [i for i, token in enumerate(xq_context) if token==second_color]
+
+
+            attn_1st_swap.append([attn_swap[b,0,0,first_color_poses].sum(0),
+                                  attn_swap[b,0,0,second_color_poses].sum(0)])
+            attn_1st_no_swap.append([attn_no_swap[b,0,0,first_color_poses].sum(0),
+                                     attn_no_swap[b,0,0,second_color_poses].sum(0)]) 
+            
+        acc_swap = np.array(acc_swap)
+        logit_1st_swap = np.array(logit_1st_swap)
+        logit_2nd_swap = np.array(logit_2nd_swap)
+        logit_rand_swap = np.array(logit_rand_swap)
+        print(f'acc_org: {acc_org.mean()}, acc_swap: {acc_swap.mean()}')
+        print(f'logit_1st_org: {logit_1st_org.mean()}, logit_1st_swap: {logit_1st_swap.mean()}')
+        print(f'logit_2nd_org: {logit_2nd_org.mean()}, logit_2nd_swap: {logit_2nd_swap.mean()}')
+        
+
+        attn_1st_swap = np.array(attn_1st_swap)
+        attn_1st_no_swap = np.array(attn_1st_no_swap)
+
+        attn_1st_no_swap = np.concatenate([attn_1st_no_swap, 1-attn_1st_no_swap.sum(1)[:,None]], axis=1)
+        attn_1st_swap = np.concatenate([attn_1st_swap, 1-attn_1st_swap.sum(1)[:,None]], axis=1)
+
+        fig, ax = plt.subplots(1,2, figsize=(10,7))
+
+        ax_t = ax[0]
+        for i in range(3):
+            filtered_no_swap = attn_1st_no_swap[:,i][(attn_1st_no_swap[:,i] >= np.percentile(attn_1st_no_swap[:,i], 5)) & 
+                                                     (attn_1st_no_swap[:,i] <= np.percentile(attn_1st_no_swap[:,i], 95))]
+            filtered_swap = attn_1st_swap[:,i][(attn_1st_swap[:,i] >= np.percentile(attn_1st_swap[:,i], 5)) & 
+                                                     (attn_1st_swap[:,i] <= np.percentile(attn_1st_swap[:,i], 95))]
+            # draw violin plot
+            ax_t.violinplot(filtered_no_swap[:,None], [i], showmeans=False, showmedians=True)
+            ax_t.violinplot(filtered_swap[:,None], [i+3], showmeans=False, showmedians=True)
+
+        ax_t.set_xticks(np.arange(6))
+        ax_t.set_xticklabels(['1st', '2nd', 'rand', '1st swapped', '2nd swapped', 'rand swapped'], rotation=45)
+        ax_t.set_title('Dec-1.5 attn')
+        ax_t.set_ylim([0,1])
+
+        ax_t = ax[1]
+        filtered_1st_org = logit_1st_org[(logit_1st_org >= np.percentile(logit_1st_org, 5)) &
+                                          (logit_1st_org <= np.percentile(logit_1st_org, 95))]
+
+        filtered_2nd_org = logit_2nd_org[(logit_2nd_org >= np.percentile(logit_2nd_org, 5)) &
+                                          (logit_2nd_org <= np.percentile(logit_2nd_org, 95))]
+        filtered_rand_org = logit_rand_org[(logit_rand_org >= np.percentile(logit_rand_org, 5)) &
+                                          (logit_rand_org <= np.percentile(logit_rand_org, 95))]
+
+        # draw violin plot
+        ax_t.violinplot(filtered_1st_org[:,None], [0], showmeans=False, showmedians=True)
+        ax_t.violinplot(filtered_2nd_org[:,None], [1], showmeans=False, showmedians=True)
+        ax_t.violinplot(filtered_rand_org[:,None], [2], showmeans=False, showmedians=True)
+        filtered_1st_swap = logit_1st_swap[(logit_1st_swap >= np.percentile(logit_1st_swap, 5)) &
+                                          (logit_1st_swap <= np.percentile(logit_1st_swap, 95))]
+
+        filtered_2nd_swap = logit_2nd_swap[(logit_2nd_swap >= np.percentile(logit_2nd_swap, 5)) &
+                                          (logit_2nd_swap <= np.percentile(logit_2nd_swap, 95))]
+        filtered_rand_swap = logit_rand_swap[(logit_rand_swap >= np.percentile(logit_rand_swap, 5)) &
+                                          (logit_rand_swap <= np.percentile(logit_rand_swap, 95))]
+
+        ax_t.violinplot(filtered_1st_swap[:,None], [3], showmeans=False, showmedians=True)
+        ax_t.violinplot(filtered_2nd_swap[:,None], [4], showmeans=False, showmedians=True)
+        ax_t.violinplot(filtered_rand_swap[:,None], [5], showmeans=False, showmedians=True)
+        ax_t.set_xticks([0,1,2,3,4,5])
+        ax_t.set_xticklabels(['1st', '2nd', 'rand', '1st swapped', '2nd swapped', 'rand swapped'], rotation=45)
+
+        ax_t.set_title('Logit')
+        # ax_t.set_ylim([0,1])
+
+        # plt.savefig(self.plot_dir/'attn_1st_swap.png')
+
+
+        plt.show()
+
+
+
+        print(attn_1st_swap.mean(0))
+        print(attn_1st_no_swap.mean(0))
+
+        a=1
+
+
+
 
 
 
@@ -835,26 +1126,20 @@ class Analyzer:
 
 
 
-    def run_path_patching(self, circuit: dict={}, patch_data: list=[], one_back=True, metric=None, rewrite=0):
-        
+    def run_path_patching(self, circuit: dict={}, patch_data: list=[], one_back=True, rewrite=0):
+        """
+        Given the circuit, evaluate the perturbation from source to receiver,
+        conditioned on each progressive output.
 
-        # assert mode in ['out', 'z','q','k','v'], 'mode must be z, q, k or v'
+        There is no metric function, only keep the cache of the perturbed activations.
+        """
 
         net = self.net
         langs = self.langs
-        # perma_ablate_names = get_module_names_by_regex(net, 
-        #                                                [{'module':'*encoder*layer*0*z_hook*','head':'3'},
-        #                                                 {'module':'*encoder*layer*0*z_hook*','head':'4'}
-        #                                                 ])
-
 
         sender_names = circuit['sender_names']
         receiver_names_chain = circuit['receiver_names']
-        freeze_names = MLC_utils.get_module_names_by_regex(self.net, [
-            {'module':'*q_hook*', 'head':'*'},
-            {'module':'*k_hook*', 'head':'*'},
-            {'module':'*v_hook*', 'head':'*'}
-            ])
+        freeze_names_chain = circuit.get('freeze_names', ['All']*len(receiver_names_chain))
         knockout_names = circuit['knockout_names']
         null_activations = torch.load(self.null_dataset_path)
 
@@ -868,8 +1153,7 @@ class Analyzer:
         all_hook_names = MLC_utils.get_module_names_by_regex(self.net, [{'module':'*hook*', 'head':'*'}])
         cache_clean, hooked_cache_modules = hook_functions.add_hooks(net, mode='cache', hook_names=all_hook_names)
         output_clean = MLC_utils.eval_model(val_batch, net, langs)
-        logits_clean = output_clean['logits_correct']  
-        loss_clean = output_clean['loss'] 
+
         [hooked_module.remove_hooks() for hooked_module in hooked_cache_modules]
 
         # get corrupted activation at the sender    
@@ -883,6 +1167,15 @@ class Analyzer:
 
                 # patch clean activations to the freeze hooks
                 # need to remove senders and receiver from frozen hooks
+                freeze_names = freeze_names_chain[0]
+                if freeze_names=='None':
+                    freeze_names = []
+                elif freeze_names=='All':
+                    freeze_names = MLC_utils.get_module_names_by_regex(self.net, [
+                        {'module':'*q_hook*', 'head':'*'},
+                        {'module':'*k_hook*', 'head':'*'},
+                        {'module':'*v_hook*', 'head':'*'}
+                        ])
                 freeze_names_exclusive = [name for name in freeze_names if name not in 
                                           sender_names+receiver_names_chain[0]+knockout_names]
                 clean_freeze_activation = [cache_clean.cache[str(name)] for name in freeze_names_exclusive]
@@ -897,14 +1190,12 @@ class Analyzer:
                 cache_patch, receiver_modules = hook_functions.add_hooks(net, mode='cache', hook_names=all_hook_names)
 
                 output_patch = MLC_utils.eval_model(val_batch, net, langs)
-                logits_patch = output_patch['logits_correct']
-
-                loss_patch = output_patch['loss']
                 [hooked_module.remove_hooks() for hooked_module in sender_modules+freeze_modules+receiver_modules+knockout_modules]
 
                 if len(receiver_names_chain)==1:
                     break
                 else:
+                    freeze_names = freeze_names_chain.pop(0)
                     sender_names = receiver_names_chain.pop(0)
                     corrupt_sender_activation = [cache_patch.cache[str(name)] for name in sender_names]
             
@@ -931,14 +1222,13 @@ class Analyzer:
             cache_patch, receiver_modules = hook_functions.add_hooks(net, mode='cache', hook_names=receiver_names_chain)
 
             output_patch = MLC_utils.eval_model(val_batch, net, langs)
-            loss_patch = output_patch['loss']
-            logits_patch = output_patch['logits_correct']
+
             [hooked_module.remove_hooks() for hooked_module in sender_modules+freeze_modules+knockout_modules+receiver_modules]
             
             # if no receiver, the second run is the last run
             # no third run
 
-        return cache_patch
+        return cache_patch, output_patch
 
 
 
